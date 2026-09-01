@@ -1,6 +1,6 @@
 {
   "name": "shop-report-organizer-v3",
-  "version": "0.1.0+codex.20260901033842",
+  "version": "0.1.0+codex.20260901062550",
   "description": "Organize shop reports and maintain a time-aware product cost database without replacing V2.",
   "author": {
     "name": "Chen Fei"
