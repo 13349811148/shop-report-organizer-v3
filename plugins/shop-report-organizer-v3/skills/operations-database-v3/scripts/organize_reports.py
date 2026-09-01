@@ -1,0 +1,5547 @@
+#!/usr/bin/env python
+"""Organize shop backend reports by reading spreadsheet content."""
+
+from __future__ import annotations
+
+import argparse
+import codecs
+import csv
+import datetime as dt
+import hashlib
+import json
+import math
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import zipfile
+import zlib
+from collections import Counter, defaultdict
+from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
+from pathlib import Path, PurePosixPath
+from typing import Iterable
+
+from order_line_protection import (
+    ORDER_SALES_MARK_HEADERS,
+    apply_order_sales_marks,
+    classify_order_line,
+)
+from marketing_activity_maintenance import (
+    apply_marketing_activity_plan,
+    change_details_from_plan,
+    prepare_marketing_activity_plan,
+)
+from database_layout import (
+    AFTER_SALE_DATABASE_DIR,
+    INPUT_DIR,
+    OPERATIONS_LOG_DIR,
+    ORDER_DATABASE_DIR,
+    PRODUCT_DATABASE_DIR,
+    PRODUCT_ID_DATABASE_DIR,
+    PROMOTION_DATABASE_DIR,
+    REPORT_ROOT_BY_TYPE,
+    ensure_layout,
+    product_map_path,
+    report_root,
+)
+
+
+SKILL_DIR = Path(__file__).resolve().parents[1]
+REFERENCES_DIR = SKILL_DIR / "references"
+SIGNATURES_PATH = REFERENCES_DIR / "report_signatures.csv"
+EXPECTED_REPORTS_PATH = REFERENCES_DIR / "expected_reports.csv"
+SUPPORTED_EXTENSIONS = {".csv", ".xlsx", ".xls"}
+SUPPORTED_ARCHIVE_EXTENSIONS = {".zip"}
+EXTRACTED_ZIP_FOLDER_NAME = "_已解压ZIP"
+DUPLICATE_INPUT_FOLDER_NAME = "_重复文件"
+INVALID_FILENAME_CHARS = r'<>:"/\|?*'
+PRODUCT_ID_CHECK_REPORT_TYPES = {"订单数据", "售后数据", "推广数据"}
+PRODUCT_DATA_REQUIRED_SOURCE_REPORT_TYPES = {"订单数据", "推广数据"}
+PRODUCT_HISTORY_SOURCE_REPORT_TYPES = {"售后数据"}
+ORDER_REPORT_TYPE = "订单数据"
+ORDER_DATA_PREFIX = "订单数据"
+AFTER_SALE_REPORT_TYPE = "售后数据"
+AFTER_SALE_UPDATE_PREFIX = "售后数据更新至"
+PROMOTION_REPORT_TYPE = "推广数据"
+PROMOTION_DATA_PREFIX = "推广数据"
+PROMOTION_ARCHIVE_DATE_HEADER = "归档日期"
+PROMOTION_ARCHIVE_PRODUCT_ID_HEADER = "归档商品ID"
+PROMOTION_ARCHIVE_TYPE_HEADER = "归档推广类型"
+PDD_DAILY_BREAKDOWN_REQUIRED_HEADERS = {
+    "日期",
+    "曝光量",
+    "点击量",
+    "总花费(元)",
+    "净实际投产比",
+}
+PROMOTION_SPEND_HEADERS_BY_TYPE = {
+    "拼多多-商品推广": ("总花费(元)", "成交花费(元)"),
+    "万相台": ("花费",),
+    "新客加速": ("预估新客加速费用", "预估抽佣金额"),
+    "老客加速": ("预估老客加速费用",),
+}
+PROMOTION_ADJUSTMENT_REPORT_TYPE = "推广调整日志"
+PROMOTION_ADJUSTMENT_UPDATE_PREFIX = "推广调整日志更新至"
+ORDER_SUMMARY_PREFIX = "订单汇总表"
+ORDER_ID_HEADERS = ["订单号", "子订单编号", "主订单编号"]
+ORDER_PAYMENT_TIME_HEADERS = [
+    "订单支付时间",
+    "支付时间",
+    "订单付款时间",
+]
+ORDER_TRANSACTION_TIME_HEADERS = ["订单成交时间"]
+ORDER_CREATION_TIME_HEADERS = ["订单创建时间"]
+ORDER_STATUS_HEADERS = ["订单状态", "交易状态"]
+UNPAID_OR_CANCELLED_STATUS_KEYWORDS = ("已取消", "待付款", "待支付", "未付款", "交易关闭", "已关闭")
+ORDER_TIME_HEADERS = [
+    *ORDER_PAYMENT_TIME_HEADERS,
+    *ORDER_TRANSACTION_TIME_HEADERS,
+    *ORDER_CREATION_TIME_HEADERS,
+]
+PREVIEW_MAX_ROWS = 100_000
+EXCEL_MAX_DATA_ROWS = 1_048_575
+XLS_MAX_COLUMNS = 256
+ORDER_HEADER_SEARCH_ROWS = 20
+ORDER_XLS_SHEET_MARKER = "__CODEX_ORDER_SHEET__"
+STREAM_COMMIT_INTERVAL = 2_000
+TMALL_PLATFORM = "天猫"
+TMALL_SHOP_SUFFIX = "（天猫）"
+ORDER_SUMMARY_METADATA_HEADERS = ["汇总_店铺名称", "汇总_最新下载时间", "汇总_最新来源文件", "汇总_最新归档文件"]
+PROTECTED_ORDER_INFO_EXACT_HEADERS = {"消费者资料", "省", "市", "区", "用户购买手机号", "门店名称", "门店自定义编码"}
+PROTECTED_ORDER_INFO_KEYWORDS = ["收件", "收货地址", "收货人", "详细地址", "地址", "手机号", "电话"]
+PROTECTED_ORDER_INFO_EXCLUDE_KEYWORDS = ["仓库", "配送员", "时间", "状态", "是否"]
+MISSING_REMINDER_FIELDNAMES = [
+    "action",
+    "status",
+    "report_type",
+    "detected_count",
+    "shop_name",
+    "source_name",
+    "source_path",
+    "new_product_ids",
+    "marketing_new_rows",
+    "marketing_updated_rows",
+    "marketing_unchanged_rows",
+    "marketing_backup_path",
+    "message",
+    "input_path",
+]
+UNRECORDED_PRODUCT_MAPPING_HEADERS = [
+    "提醒类型",
+    "店铺",
+    "商品ID",
+    "样式ID",
+    "商家编码-规格维度",
+    "商品名称/售后SKU",
+    "来源",
+]
+
+
+@dataclass
+class Signature:
+    report_type: str
+    target_folder: str
+    platform: str
+    required_headers: list[str]
+    product_id_headers: list[str]
+    period_headers: list[str]
+    period_mode: str
+    promotion_type: str
+    notes: str
+
+
+@dataclass
+class Analysis:
+    source: Path
+    status: str
+    reason: str
+    report_type: str
+    target_folder: str
+    shop_name: str
+    shop_source: str
+    period: str
+    period_source: str
+    download_date: str
+    target_path: Path
+    product_counts: str
+    matched_headers: str
+    missing_fields: str
+    map_updates: list[tuple[str, str]]
+    product_ids: list[str]
+    new_product_ids: list[str]
+    supplementary_price_rows: int = 0
+    supplementary_price_examples: str = ""
+
+
+@dataclass
+class PromotionRow:
+    sheet_name: str
+    row_number: int
+    headers: list[str]
+    values: list[str]
+    signature: Signature
+
+
+@dataclass
+class PromotionValidation:
+    data_rows: int
+    valid_rows: int
+    missing_date_rows: int
+    missing_product_id_rows: int
+    examples: list[str]
+
+
+@dataclass(frozen=True)
+class PddPromotionFilenameMetadata:
+    shop_text: str
+    item_token: str
+    filename_product_id: str
+
+
+@dataclass
+class ExpectedReport:
+    report_type: str
+    required: bool
+    reminder_message: str
+
+
+@dataclass
+class OrderFileScan:
+    month_keys: set[str]
+    order_ids: set[str]
+    alias_ids: set[str]
+    ambiguous_main_ids: set[str]
+    read_rows: int
+    valid_rows: int
+    ignored_rows: int
+
+
+@dataclass
+class OrderRow:
+    sheet_name: str
+    row_number: int
+    headers: list[str]
+    id_columns: list[tuple[str, int]]
+    time_columns: list[tuple[str, int]]
+    values: list[str]
+
+
+def read_utf8_sig_csv(path: Path) -> list[dict[str, str]]:
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        return list(csv.DictReader(handle))
+
+
+def write_utf8_sig_csv(path: Path, rows: list[dict[str, str]], fieldnames: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def split_cell(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return [part.strip() for part in value.split("|") if part.strip()]
+
+
+def load_signatures(path: Path = SIGNATURES_PATH) -> list[Signature]:
+    signatures: list[Signature] = []
+    for row in read_utf8_sig_csv(path):
+        signatures.append(
+            Signature(
+                report_type=row["report_type"].strip(),
+                target_folder=row["target_folder"].strip(),
+                platform=normalize_text(row.get("platform", "")),
+                required_headers=split_cell(row.get("required_headers")),
+                product_id_headers=split_cell(row.get("product_id_headers")),
+                period_headers=split_cell(row.get("period_headers")),
+                period_mode=row.get("period_mode", "").strip(),
+                promotion_type=normalize_text(row.get("promotion_type", "")),
+                notes=row.get("notes", "").strip(),
+            )
+        )
+    return signatures
+
+
+def truthy(value: object) -> bool:
+    text = normalize_text(value).lower()
+    return text in {"1", "true", "yes", "y", "是", "必备", "required"}
+
+
+def load_expected_reports(path: Path = EXPECTED_REPORTS_PATH) -> list[ExpectedReport]:
+    if not path.exists():
+        return []
+    expected_reports: list[ExpectedReport] = []
+    for row in read_utf8_sig_csv(path):
+        report_type = normalize_text(row.get("report_type", ""))
+        if not report_type:
+            continue
+        expected_reports.append(
+            ExpectedReport(
+                report_type=report_type,
+                required=truthy(row.get("required", "")),
+                reminder_message=normalize_text(row.get("reminder_message", "")),
+            )
+        )
+    return expected_reports
+
+
+def load_product_map(path: Path) -> dict[str, str]:
+    if not path.exists():
+        return {}
+    mapping: dict[str, str] = {}
+    for row in read_utf8_sig_csv(path):
+        product_id = normalize_product_id(row.get("product_id", ""))
+        shop_name = (row.get("shop_name") or "").strip()
+        if product_id and shop_name:
+            mapping[product_id] = shop_name
+    return mapping
+
+
+def save_product_map(mapping: dict[str, str], path: Path) -> None:
+    rows = [
+        {"product_id": product_id, "shop_name": shop_name, "source": "organize_reports"}
+        for product_id, shop_name in sorted(mapping.items(), key=lambda item: (item[1], item[0]))
+    ]
+    write_utf8_sig_csv(path, rows, ["product_id", "shop_name", "source"])
+
+
+def normalize_text(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    return str(value).replace("\r", " ").replace("\n", " ").strip()
+
+
+def normalize_header(value: object) -> str:
+    return normalize_text(value).lower().replace(" ", "")
+
+
+def normalize_product_id(value: object) -> str:
+    text = normalize_text(value)
+    if re.fullmatch(r"\d+\.0", text):
+        text = text[:-2]
+    digits = re.sub(r"\D", "", text)
+    return digits if len(digits) >= 6 else ""
+
+
+def read_csv_rows(path: Path, max_rows: int) -> list[list[str]]:
+    encoding = detect_csv_encoding(path)
+    rows: list[list[str]] = []
+    with path.open("r", encoding=encoding, errors="strict", newline="") as handle:
+        first_line = handle.readline()
+        delimiter = "\t" if "\t" in first_line and "," not in first_line else ","
+        handle.seek(0)
+        for index, row in enumerate(csv.reader(handle, delimiter=delimiter)):
+            if index >= max_rows:
+                break
+            values = [normalize_text(cell) for cell in row]
+            if any(values):
+                rows.append(values)
+    return rows
+
+
+def read_xlsx_rows(path: Path, max_rows: int, max_cols: int) -> list[list[str]]:
+    try:
+        import openpyxl
+    except ImportError as exc:  # pragma: no cover - environment specific
+        raise RuntimeError("openpyxl is required for .xlsx files") from exc
+
+    workbook = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    rows: list[list[str]] = []
+    # Some platform exports keep their usable headers in a hidden worksheet.
+    # Inspect all worksheets while keeping the per-file row limit intact.
+    for worksheet in workbook.worksheets:
+        if len(rows) >= max_rows:
+            break
+        if hasattr(worksheet, "reset_dimensions"):
+            try:
+                dimension = worksheet.calculate_dimension()
+            except ValueError:
+                worksheet.reset_dimensions()
+            else:
+                if dimension == "A1:A1":
+                    worksheet.reset_dimensions()
+        remaining_rows = max_rows - len(rows)
+        for row in worksheet.iter_rows(
+            min_row=1,
+            max_row=remaining_rows,
+            max_col=max_cols,
+            values_only=True,
+        ):
+            values = [normalize_text(cell) for cell in row]
+            if any(values):
+                rows.append(values)
+    workbook.close()
+    return rows
+
+
+def powershell_exe() -> str:
+    return shutil.which("powershell.exe") or shutil.which("powershell") or "powershell"
+
+
+def read_xls_rows(
+    path: Path,
+    max_rows: int,
+    max_cols: int,
+    *,
+    all_worksheets: bool = False,
+    include_sheet_markers: bool = False,
+) -> list[list[str]]:
+    all_worksheets_ps = "$true" if all_worksheets else "$false"
+    include_sheet_markers_ps = "$true" if include_sheet_markers else "$false"
+    ps_script = rf"""
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+$path = @'
+{str(path)}
+'@
+$maxRows = {max_rows}
+$maxCols = {max_cols}
+$allWorksheets = {all_worksheets_ps}
+$includeSheetMarkers = {include_sheet_markers_ps}
+$excel = $null
+try {{
+  $excel = New-Object -ComObject Excel.Application
+  $excel.Visible = $false
+  $excel.DisplayAlerts = $false
+  $wb = $excel.Workbooks.Open($path, 0, $true)
+  try {{
+    $result = @()
+    $sheetCount = if ($allWorksheets) {{ $wb.Worksheets.Count }} else {{ 1 }}
+    for ($s = 1; $s -le $sheetCount; $s++) {{
+      $ws = $wb.Worksheets.Item($s)
+      if ($includeSheetMarkers) {{
+        $result += [PSCustomObject]@{{ cells = @('{ORDER_XLS_SHEET_MARKER}', [string]$ws.Name) }}
+      }}
+      $used = $ws.UsedRange
+      $rows = [Math]::Min($maxRows, $used.Rows.Count)
+      $cols = [Math]::Min($maxCols, $used.Columns.Count)
+      for ($r = 1; $r -le $rows; $r++) {{
+        $vals = @()
+        for ($c = 1; $c -le $cols; $c++) {{
+          $vals += [string]$ws.Cells.Item($r, $c).Text
+        }}
+        if ((($vals -join '')).Trim().Length -gt 0) {{
+          $result += [PSCustomObject]@{{ cells = $vals }}
+        }}
+      }}
+    }}
+    $result | ConvertTo-Json -Compress -Depth 5
+  }} finally {{
+    $wb.Close($false)
+  }}
+}} finally {{
+  if ($excel -ne $null) {{
+    $excel.Quit() | Out-Null
+    [System.Runtime.InteropServices.Marshal]::ReleaseComObject($excel) | Out-Null
+  }}
+}}
+"""
+    completed = subprocess.run(
+        [powershell_exe(), "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_script],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        encoding="utf-8",
+        errors="replace",
+    )
+    output = completed.stdout.strip()
+    if not output:
+        return []
+    parsed = json.loads(output)
+    if isinstance(parsed, dict):
+        parsed = [parsed]
+    rows = [item.get("cells", []) for item in parsed if isinstance(item, dict)]
+    return [[normalize_text(cell) for cell in row] for row in rows if any(normalize_text(cell) for cell in row)]
+
+
+def read_rows(path: Path, max_rows: int, max_cols: int) -> list[list[str]]:
+    suffix = path.suffix.lower()
+    if suffix == ".csv":
+        return read_csv_rows(path, max_rows)
+    if suffix == ".xlsx":
+        return read_xlsx_rows(path, max_rows, max_cols)
+    if suffix == ".xls":
+        return read_xls_rows(path, max_rows, max_cols)
+    raise RuntimeError(f"unsupported extension: {suffix}")
+
+
+def detect_csv_encoding(path: Path) -> str:
+    for encoding in ("utf-8-sig", "gb18030", "utf-8"):
+        decoder = codecs.getincrementaldecoder(encoding)(errors="strict")
+        try:
+            with path.open("rb") as handle:
+                while chunk := handle.read(1024 * 1024):
+                    decoder.decode(chunk)
+                decoder.decode(b"", final=True)
+            return encoding
+        except UnicodeDecodeError:
+            continue
+    raise RuntimeError(f"CSV encoding cannot be decoded: {path}")
+
+
+def iter_csv_rows_full(path: Path) -> Iterable[list[str]]:
+    encoding = detect_csv_encoding(path)
+    with path.open("r", encoding=encoding, errors="strict", newline="") as handle:
+        first_line = handle.readline()
+        delimiter = "\t" if "\t" in first_line and "," not in first_line else ","
+        handle.seek(0)
+        for row in csv.reader(handle, delimiter=delimiter):
+            values = [normalize_text(cell) for cell in row]
+            if any(values):
+                yield values
+
+
+def iter_xlsx_rows_full(path: Path, max_cols: int) -> Iterable[list[str]]:
+    del max_cols  # Formal cumulative processing preserves every effective column.
+    try:
+        import openpyxl
+    except ImportError as exc:  # pragma: no cover - environment specific
+        raise RuntimeError("openpyxl is required for .xlsx files") from exc
+
+    workbook = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    try:
+        for worksheet in workbook.worksheets:
+            if hasattr(worksheet, "reset_dimensions"):
+                try:
+                    dimension = worksheet.calculate_dimension()
+                except ValueError:
+                    worksheet.reset_dimensions()
+                else:
+                    if dimension == "A1:A1":
+                        worksheet.reset_dimensions()
+            for row in worksheet.iter_rows(min_row=1, values_only=True):
+                values = [normalize_text(cell) for cell in row]
+                if any(values):
+                    yield values
+    finally:
+        workbook.close()
+
+
+def iter_rows_full(path: Path, max_cols: int) -> Iterable[list[str]]:
+    suffix = path.suffix.lower()
+    if suffix == ".csv":
+        yield from iter_csv_rows_full(path)
+        return
+    if suffix == ".xlsx":
+        yield from iter_xlsx_rows_full(path, max_cols)
+        return
+    if suffix == ".xls":
+        # Legacy .xls worksheets cannot exceed 65,536 rows, so a complete COM
+        # read remains below the Excel single-sheet limit.
+        yield from read_xls_rows(path, EXCEL_MAX_DATA_ROWS + 1, XLS_MAX_COLUMNS)
+        return
+    raise RuntimeError(f"unsupported extension: {suffix}")
+
+
+def header_contains(headers: list[str], required: str) -> bool:
+    needle = normalize_header(required)
+    return any(needle in normalize_header(header) for header in headers)
+
+
+def find_header_index(headers: list[str], candidates: Iterable[str]) -> int | None:
+    for candidate in candidates:
+        needle = normalize_header(candidate)
+        for index, header in enumerate(headers):
+            if needle and needle in normalize_header(header):
+                return index
+    return None
+
+
+def find_header_indices(headers: list[str], candidates: Iterable[str]) -> list[tuple[str, int]]:
+    matches: list[tuple[str, int]] = []
+    seen_indices: set[int] = set()
+    for candidate in candidates:
+        needle = normalize_header(candidate)
+        index = next(
+            (
+                header_index
+                for header_index, header in enumerate(headers)
+                if header_index not in seen_indices and normalize_header(header) == needle
+            ),
+            None,
+        )
+        if index is None:
+            index = next(
+                (
+                    header_index
+                    for header_index, header in enumerate(headers)
+                    if header_index not in seen_indices
+                    and needle
+                    and needle in normalize_header(header)
+                ),
+                None,
+            )
+        if index is not None and index not in seen_indices:
+            matches.append((candidate, index))
+            seen_indices.add(index)
+    return matches
+
+
+def order_time_columns(headers: list[str]) -> list[tuple[str, int]]:
+    candidates = [*ORDER_PAYMENT_TIME_HEADERS, *ORDER_TRANSACTION_TIME_HEADERS]
+    if (
+        find_header_index(headers, ["子订单编号"]) is not None
+        and find_header_index(headers, ["主订单编号"]) is not None
+    ):
+        candidates.extend(ORDER_CREATION_TIME_HEADERS)
+    return find_header_indices(headers, candidates)
+
+
+def order_id_columns(headers: list[str]) -> list[tuple[str, int]]:
+    tmall_columns = find_header_indices(headers, ["子订单编号", "主订单编号"])
+    if tmall_columns:
+        return tmall_columns
+    return find_header_indices(headers, ["订单号"])
+
+
+def resolve_order_id_from_columns(
+    row: list[str], id_columns: list[tuple[str, int]]
+) -> tuple[str, str, str]:
+    raw_values: list[str] = []
+    for header, column_index in id_columns:
+        raw_value = normalize_text(row[column_index]) if column_index < len(row) else ""
+        raw_values.append(f"{header}={raw_value or '空'}")
+        if raw_value:
+            return raw_value, header, "；".join(raw_values)
+    return "", "", "；".join(raw_values) or "未找到订单号列"
+
+
+def order_identifier_values(
+    row: list[str], id_columns: list[tuple[str, int]]
+) -> tuple[str, str, str, str, set[str]]:
+    values = {
+        header: normalize_text(row[column_index]) if column_index < len(row) else ""
+        for header, column_index in id_columns
+    }
+    is_tmall = "子订单编号" in values or "主订单编号" in values
+    if is_tmall:
+        child_id = values.get("子订单编号", "")
+        main_id = values.get("主订单编号", "")
+        primary_id = child_id or main_id
+        aliases = {value for value in (child_id, main_id) if value}
+        return primary_id, child_id, main_id, "", aliases
+    order_id = values.get("订单号", "")
+    return order_id, "", "", order_id, ({order_id} if order_id else set())
+
+
+def trim_trailing_empty_cells(values: Iterable[object]) -> list[str]:
+    row = [normalize_text(value) for value in values]
+    while row and not row[-1]:
+        row.pop()
+    return row
+
+
+def is_order_header_row(values: list[str]) -> bool:
+    return bool(order_id_columns(values) and order_time_columns(values))
+
+
+def find_order_header(
+    numbered_rows: Iterable[tuple[int, list[str]]]
+) -> tuple[int, list[str]] | None:
+    nonblank_seen = 0
+    for row_number, values in numbered_rows:
+        if not any(values):
+            continue
+        nonblank_seen += 1
+        if is_order_header_row(values):
+            return row_number, values
+        if nonblank_seen >= ORDER_HEADER_SEARCH_ROWS:
+            break
+    return None
+
+
+def csv_delimiter(path: Path, encoding: str) -> str:
+    with path.open("r", encoding=encoding, errors="strict", newline="") as handle:
+        first_line = handle.readline()
+    return "\t" if "\t" in first_line and "," not in first_line else ","
+
+
+def iter_order_rows_full(path: Path, max_cols: int) -> Iterable[OrderRow]:
+    del max_cols  # Formal order processing reads all effective columns.
+    suffix = path.suffix.lower()
+    if suffix == ".csv":
+        encoding = detect_csv_encoding(path)
+        delimiter = csv_delimiter(path, encoding)
+        with path.open("r", encoding=encoding, errors="strict", newline="") as handle:
+            header_match = find_order_header(
+                (
+                    (row_number, trim_trailing_empty_cells(row))
+                    for row_number, row in enumerate(
+                        csv.reader(handle, delimiter=delimiter), start=1
+                    )
+                )
+            )
+        if header_match is None:
+            raise RuntimeError(f"订单文件没有找到有效订单工作表或表头：{path}")
+        header_row_number, headers = header_match
+        id_columns = order_id_columns(headers)
+        time_columns = order_time_columns(headers)
+        with path.open("r", encoding=encoding, errors="strict", newline="") as handle:
+            for row_number, row in enumerate(csv.reader(handle, delimiter=delimiter), start=1):
+                if row_number <= header_row_number:
+                    continue
+                values = trim_trailing_empty_cells(row)
+                if any(values):
+                    yield OrderRow(
+                        "CSV",
+                        row_number,
+                        headers,
+                        id_columns,
+                        time_columns,
+                        values,
+                    )
+        return
+
+    if suffix == ".xlsx":
+        try:
+            import openpyxl
+        except ImportError as exc:  # pragma: no cover - environment specific
+            raise RuntimeError("openpyxl is required for .xlsx files") from exc
+
+        workbook = openpyxl.load_workbook(path, read_only=True, data_only=True)
+        valid_sheet_count = 0
+        try:
+            for worksheet in workbook.worksheets:
+                if hasattr(worksheet, "reset_dimensions"):
+                    try:
+                        dimension = worksheet.calculate_dimension()
+                    except ValueError:
+                        worksheet.reset_dimensions()
+                    else:
+                        if dimension == "A1:A1":
+                            worksheet.reset_dimensions()
+                header_match = find_order_header(
+                    (
+                        (row_number, trim_trailing_empty_cells(row))
+                        for row_number, row in enumerate(
+                            worksheet.iter_rows(min_row=1, values_only=True), start=1
+                        )
+                    )
+                )
+                if header_match is None:
+                    continue
+                valid_sheet_count += 1
+                header_row_number, headers = header_match
+                id_columns = order_id_columns(headers)
+                time_columns = order_time_columns(headers)
+                for row_number, row in enumerate(
+                    worksheet.iter_rows(
+                        min_row=header_row_number + 1, values_only=True
+                    ),
+                    start=header_row_number + 1,
+                ):
+                    values = trim_trailing_empty_cells(row)
+                    if any(values):
+                        yield OrderRow(
+                            worksheet.title,
+                            row_number,
+                            headers,
+                            id_columns,
+                            time_columns,
+                            values,
+                        )
+        finally:
+            workbook.close()
+        if valid_sheet_count == 0:
+            raise RuntimeError(f"订单文件没有找到有效订单工作表或表头：{path}")
+        return
+
+    if suffix == ".xls":
+        rows = read_xls_rows(
+            path,
+            EXCEL_MAX_DATA_ROWS + 1,
+            XLS_MAX_COLUMNS,
+            all_worksheets=True,
+            include_sheet_markers=True,
+        )
+        sheets: list[tuple[str, list[tuple[int, list[str]]]]] = []
+        sheet_name = "工作表1"
+        sheet_rows: list[tuple[int, list[str]]] = []
+        for row in rows:
+            if row and row[0] == ORDER_XLS_SHEET_MARKER:
+                if sheet_rows:
+                    sheets.append((sheet_name, sheet_rows))
+                sheet_name = row[1] if len(row) > 1 and row[1] else "未命名工作表"
+                sheet_rows = []
+                continue
+            sheet_rows.append((len(sheet_rows) + 1, trim_trailing_empty_cells(row)))
+        if sheet_rows:
+            sheets.append((sheet_name, sheet_rows))
+
+        valid_sheet_count = 0
+        for current_sheet_name, numbered_rows in sheets:
+            header_match = find_order_header(numbered_rows)
+            if header_match is None:
+                continue
+            valid_sheet_count += 1
+            header_row_number, headers = header_match
+            id_columns = order_id_columns(headers)
+            time_columns = order_time_columns(headers)
+            for row_number, values in numbered_rows:
+                if row_number <= header_row_number or not any(values):
+                    continue
+                yield OrderRow(
+                    current_sheet_name,
+                    row_number,
+                    headers,
+                    id_columns,
+                    time_columns,
+                    values,
+                )
+        if valid_sheet_count == 0:
+            raise RuntimeError(f"订单文件没有找到有效订单工作表或表头：{path}")
+        return
+
+    raise RuntimeError(f"unsupported extension: {suffix}")
+
+
+def match_signature(rows: list[list[str]], signatures: list[Signature]) -> tuple[Signature | None, int, list[str], list[str]]:
+    best: tuple[int, Signature | None, int, list[str], list[str]] = (-1, None, -1, [], [])
+    for row_index, row in enumerate(rows[:20]):
+        headers = row
+        for signature in signatures:
+            matched = [header for header in signature.required_headers if header_contains(headers, header)]
+            if len(matched) == len(signature.required_headers) and len(matched) > best[0]:
+                best = (len(matched), signature, row_index, headers, matched)
+    return best[1], best[2], best[3], best[4]
+
+
+def promotion_signatures() -> list[Signature]:
+    return [
+        signature
+        for signature in load_signatures()
+        if signature.report_type == PROMOTION_REPORT_TYPE
+    ]
+
+
+def promotion_signature_for_headers(headers: list[str], signatures: list[Signature]) -> Signature | None:
+    for signature in signatures:
+        if all(header_contains(headers, required) for required in signature.required_headers):
+            return signature
+    return None
+
+
+def find_promotion_header(
+    numbered_rows: Iterable[tuple[int, list[str]]], signatures: list[Signature]
+) -> tuple[int, list[str], Signature] | None:
+    nonblank_seen = 0
+    for row_number, values in numbered_rows:
+        if not any(normalize_text(value) for value in values):
+            continue
+        nonblank_seen += 1
+        signature = promotion_signature_for_headers(values, signatures)
+        if signature is not None:
+            return row_number, values, signature
+        if nonblank_seen >= ORDER_HEADER_SEARCH_ROWS:
+            break
+    return None
+
+
+def iter_promotion_rows_full(path: Path, max_cols: int) -> Iterable[PromotionRow]:
+    signatures = promotion_signatures()
+    suffix = path.suffix.lower()
+
+    if suffix == ".csv":
+        encoding = detect_csv_encoding(path)
+        delimiter = csv_delimiter(path, encoding)
+        with path.open("r", encoding=encoding, errors="strict", newline="") as handle:
+            header_match = find_promotion_header(
+                (
+                    (row_number, trim_trailing_empty_cells(row))
+                    for row_number, row in enumerate(
+                        csv.reader(handle, delimiter=delimiter), start=1
+                    )
+                ),
+                signatures,
+            )
+        if header_match is None:
+            raise RuntimeError(f"推广文件没有找到有效推广表头：{path}")
+        header_row_number, headers, signature = header_match
+        with path.open("r", encoding=encoding, errors="strict", newline="") as handle:
+            for row_number, row in enumerate(csv.reader(handle, delimiter=delimiter), start=1):
+                if row_number <= header_row_number:
+                    continue
+                values = trim_trailing_empty_cells(row)
+                if any(values):
+                    yield PromotionRow("CSV", row_number, headers, values, signature)
+        return
+
+    if suffix == ".xlsx":
+        try:
+            import openpyxl
+        except ImportError as exc:  # pragma: no cover - environment specific
+            raise RuntimeError("openpyxl is required for .xlsx files") from exc
+
+        workbook = openpyxl.load_workbook(path, read_only=True, data_only=True)
+        valid_sheet_count = 0
+        try:
+            for worksheet in workbook.worksheets:
+                if hasattr(worksheet, "reset_dimensions"):
+                    try:
+                        dimension = worksheet.calculate_dimension()
+                    except ValueError:
+                        worksheet.reset_dimensions()
+                    else:
+                        if dimension == "A1:A1":
+                            worksheet.reset_dimensions()
+                header_match = find_promotion_header(
+                    (
+                        (row_number, trim_trailing_empty_cells(row))
+                        for row_number, row in enumerate(
+                            worksheet.iter_rows(min_row=1, values_only=True), start=1
+                        )
+                    ),
+                    signatures,
+                )
+                if header_match is None:
+                    continue
+                valid_sheet_count += 1
+                header_row_number, headers, signature = header_match
+                for row_number, row in enumerate(
+                    worksheet.iter_rows(min_row=header_row_number + 1, values_only=True),
+                    start=header_row_number + 1,
+                ):
+                    values = trim_trailing_empty_cells(row)
+                    if any(values):
+                        yield PromotionRow(worksheet.title, row_number, headers, values, signature)
+        finally:
+            workbook.close()
+        if valid_sheet_count == 0:
+            raise RuntimeError(f"推广文件没有找到有效推广工作表或表头：{path}")
+        return
+
+    if suffix == ".xls":
+        rows = read_xls_rows(
+            path,
+            EXCEL_MAX_DATA_ROWS + 1,
+            XLS_MAX_COLUMNS,
+            all_worksheets=True,
+            include_sheet_markers=True,
+        )
+        sheets: list[tuple[str, list[tuple[int, list[str]]]]] = []
+        sheet_name = "工作表"
+        sheet_rows: list[tuple[int, list[str]]] = []
+        for row in rows:
+            if row and row[0] == ORDER_XLS_SHEET_MARKER:
+                if sheet_rows:
+                    sheets.append((sheet_name, sheet_rows))
+                sheet_name = row[1] if len(row) > 1 and row[1] else "未命名工作表"
+                sheet_rows = []
+                continue
+            sheet_rows.append((len(sheet_rows) + 1, trim_trailing_empty_cells(row)))
+        if sheet_rows:
+            sheets.append((sheet_name, sheet_rows))
+
+        valid_sheet_count = 0
+        for current_sheet_name, numbered_rows in sheets:
+            header_match = find_promotion_header(numbered_rows, signatures)
+            if header_match is None:
+                continue
+            valid_sheet_count += 1
+            header_row_number, headers, signature = header_match
+            for row_number, values in numbered_rows:
+                if row_number <= header_row_number or not any(values):
+                    continue
+                yield PromotionRow(current_sheet_name, row_number, headers, values, signature)
+        if valid_sheet_count == 0:
+            raise RuntimeError(f"推广文件没有找到有效推广工作表或表头：{path}")
+        return
+
+    raise RuntimeError(f"unsupported extension: {suffix}")
+
+
+def collect_product_ids(
+    rows: list[list[str]],
+    header_row_index: int,
+    headers: list[str],
+    signature: Signature | None,
+    exclude_supplementary_price_order_lines: bool = False,
+) -> list[str]:
+    candidates = signature.product_id_headers if signature else ["商品ID", "商品id"]
+    column_index = find_header_index(headers, candidates)
+    if column_index is None:
+        for index, header in enumerate(headers):
+            normalized = normalize_header(header)
+            if "商品" in normalized and "id" in normalized:
+                column_index = index
+                break
+    product_ids: list[str] = []
+    if column_index is not None:
+        for row in rows[header_row_index + 1 :]:
+            if exclude_supplementary_price_order_lines:
+                record = row_to_dict(headers, row)
+                if classify_order_line(record).is_supplementary_price:
+                    continue
+            if column_index < len(row):
+                product_id = normalize_product_id(row[column_index])
+                if product_id:
+                    product_ids.append(product_id)
+    if not product_ids and not exclude_supplementary_price_order_lines:
+        product_id_pattern = re.compile(r"\u5546\u54c1\s*ID[\uff1a:]\s*(\d{6,})", flags=re.IGNORECASE)
+        for row in rows[header_row_index + 1 :]:
+            for cell in row:
+                for match in product_id_pattern.finditer(normalize_text(cell)):
+                    product_id = normalize_product_id(match.group(1))
+                    if product_id:
+                        product_ids.append(product_id)
+    return product_ids
+
+
+def preview_supplementary_price_order_rows(
+    rows: list[list[str]], header_row_index: int, headers: list[str], signature: Signature
+) -> tuple[int, str]:
+    """Return preview-only count and examples for order lines excluded from sales."""
+    if signature.report_type != ORDER_REPORT_TYPE:
+        return 0, ""
+    count = 0
+    examples: list[str] = []
+    for physical_row, row in enumerate(rows[header_row_index + 1 :], start=header_row_index + 2):
+        values = [normalize_text(value) for value in row]
+        if not any(values) or is_ignorable_order_row(values):
+            continue
+        classification = classify_order_line(row_to_dict(headers, values))
+        if not classification.is_supplementary_price:
+            continue
+        count += 1
+        if len(examples) < 3:
+            examples.append(
+                f"第{physical_row}行，{classification.title_header or '订单性质'}="
+                f"{classification.original_title or '补差价'}"
+            )
+    return count, "；".join(examples)
+
+
+def shop_from_product_archive_path(path: Path, database_root: Path) -> str:
+    product_root = database_root / PRODUCT_DATABASE_DIR
+    try:
+        relative = path.relative_to(product_root)
+    except ValueError:
+        return ""
+    if not relative.parts:
+        return ""
+    shop_name = relative.parts[0]
+    return "" if shop_name.startswith("_") else shop_name
+
+
+def load_archived_product_map(
+    database_root: Path,
+    signatures: list[Signature],
+    existing_map: dict[str, str],
+    max_rows: int,
+    max_cols: int,
+) -> dict[str, str]:
+    product_root = database_root / PRODUCT_DATABASE_DIR
+    if not product_root.exists():
+        return {}
+
+    archived_map: dict[str, str] = {}
+    for path in sorted(product_root.rglob("*")):
+        if not path.is_file() or path.suffix.lower() not in SUPPORTED_EXTENSIONS:
+            continue
+        shop_name = shop_from_product_archive_path(path, database_root)
+        if not shop_name:
+            continue
+        try:
+            rows = read_rows(path, max_rows, max_cols)
+            signature, header_row_index, headers, _matched = match_signature(rows, signatures)
+        except Exception:
+            continue
+        if signature is None or signature.report_type != "商品数据":
+            continue
+        for product_id in collect_product_ids(rows, header_row_index, headers, signature):
+            if product_id and product_id not in existing_map and product_id not in archived_map:
+                archived_map[product_id] = shop_name
+    return archived_map
+
+
+def known_shops(database_root: Path, product_map: dict[str, str]) -> list[str]:
+    shops = set(product_map.values())
+    for folder_name in dict.fromkeys(REPORT_ROOT_BY_TYPE.values()):
+        root = database_root / folder_name
+        if root.exists():
+            for child in root.iterdir():
+                if child.is_dir() and not child.name.startswith("_"):
+                    shops.add(child.name)
+    return sorted(shops, key=len, reverse=True)
+
+
+def strip_platform_suffix(shop_name: str) -> str:
+    return re.sub(r"[（(]\s*天猫\s*[）)]$", "", normalize_text(shop_name), flags=re.IGNORECASE)
+
+
+def is_tmall_shop(shop_name: str) -> bool:
+    return bool(re.search(r"[（(]\s*天猫\s*[）)]$", normalize_text(shop_name), flags=re.IGNORECASE))
+
+
+def normalize_shop_platform(shop_name: str, platform: str) -> str:
+    shop_name = normalize_text(shop_name)
+    if not shop_name:
+        return ""
+    if normalize_text(platform).lower() in {"天猫", "tmall"}:
+        return f"{strip_platform_suffix(shop_name)}{TMALL_SHOP_SUFFIX}"
+    return shop_name
+
+
+def detect_platform(path: Path, rows: list[list[str]], signature: Signature) -> tuple[str, str]:
+    if signature.platform:
+        return signature.platform, "report_signature"
+    searchable = [path.name]
+    for row in rows[:300]:
+        searchable.extend(normalize_text(cell) for cell in row if normalize_text(cell))
+    text = " ".join(searchable).lower()
+    if "天猫" in text or "tmall" in text:
+        return TMALL_PLATFORM, "filename_or_spreadsheet_text"
+    return "", ""
+
+
+def canonicalize_shop(text: str, shops: list[str]) -> str:
+    compact = re.sub(r"\s+", "", text)
+    text_is_tmall = "天猫" in compact or "tmall" in compact.lower()
+    ordered_shops = sorted(shops, key=lambda shop: (is_tmall_shop(shop) != text_is_tmall, -len(shop)))
+    for shop in ordered_shops:
+        base_shop = strip_platform_suffix(shop)
+        if shop and shop in compact:
+            return shop
+        if base_shop and base_shop in compact:
+            return shop
+        short_shop = re.sub(r"(旗舰店|专卖店|专营店)$", "", base_shop)
+        if short_shop and short_shop in compact:
+            return shop
+    match = re.search(r"商家[（(]([^）)]+)[）)]", compact)
+    if match:
+        candidate = re.sub(r"(客服|平台|商家|极速退款)", "", match.group(1))
+        candidate = re.sub(r"(\d+号|[A-Za-z]*\d+|晶晶|小惠)$", "", candidate)
+        for shop in ordered_shops:
+            base_shop = strip_platform_suffix(shop)
+            if candidate and (candidate in base_shop or base_shop in candidate):
+                return shop
+    return ""
+
+
+def extract_explicit_shop(rows: list[list[str]], shops: list[str]) -> tuple[str, str]:
+    for row in rows[:300]:
+        for cell in row:
+            text = normalize_text(cell)
+            if not text:
+                continue
+            shop = canonicalize_shop(text, shops)
+            if shop:
+                return shop, "spreadsheet_text"
+    return "", ""
+
+
+def extract_shop_from_filename(path: Path, shops: list[str]) -> tuple[str, str]:
+    match = re.search(r"[（(]([^）)]+)[）)]", path.name)
+    if not match:
+        return "", ""
+    text = match.group(1).strip()
+    if re.fullmatch(r"\d+", text):
+        return "", ""
+    canonical_shop = canonicalize_shop(text, shops)
+    if canonical_shop:
+        return canonical_shop, "filename_parentheses"
+    text = re.sub(r"^(?:天猫|淘宝|拼多多|pdd)\s*[-—_ ]+", "", text, flags=re.IGNORECASE)
+    for shop in shops:
+        if text == shop or text in shop or shop in text:
+            return shop, "filename_parentheses"
+    return text, "filename_parentheses"
+
+
+def pdd_daily_breakdown_filename_metadata(
+    path: Path,
+) -> PddPromotionFilenameMetadata | None:
+    """Parse metadata only from the exact Pinduoduo per-day export filename."""
+    match = re.fullmatch(
+        r"商品推广_分天数据_(20\d{6})至(20\d{6})"
+        r"\(([^()]+)\)\(([^()]+_(\d{6,}))\)",
+        path.stem,
+    )
+    if match is None:
+        return None
+    return PddPromotionFilenameMetadata(
+        shop_text=match.group(3).strip(),
+        item_token=match.group(4).strip(),
+        filename_product_id=normalize_product_id(match.group(5)),
+    )
+
+
+def pdd_operation_log_filename_metadata(
+    path: Path,
+) -> PddPromotionFilenameMetadata | None:
+    """Parse the matching Pinduoduo operation-log filename for ID evidence."""
+    match = re.fullmatch(
+        r"商品推广操作日志_\d{6,8}\(([^()]+)\)\(([^()]+_(\d{6,}))\)",
+        path.stem,
+    )
+    if match is None:
+        return None
+    return PddPromotionFilenameMetadata(
+        shop_text=match.group(1).strip(),
+        item_token=match.group(2).strip(),
+        filename_product_id=normalize_product_id(match.group(3)),
+    )
+
+
+def is_pdd_daily_breakdown_signature(signature: Signature) -> bool:
+    required = {normalize_header(header) for header in signature.required_headers}
+    expected = {normalize_header(header) for header in PDD_DAILY_BREAKDOWN_REQUIRED_HEADERS}
+    return (
+        signature.report_type == PROMOTION_REPORT_TYPE
+        and signature.platform == "拼多多"
+        and signature.promotion_type == "拼多多-商品推广"
+        and expected.issubset(required)
+        and not signature.product_id_headers
+    )
+
+
+def promotion_analysis_fallback_product_id(analysis: Analysis) -> str:
+    if (
+        analysis.report_type != PROMOTION_REPORT_TYPE
+        or pdd_daily_breakdown_filename_metadata(analysis.source) is None
+    ):
+        return ""
+    product_ids = list(
+        dict.fromkeys(
+            normalize_product_id(product_id)
+            for product_id in analysis.product_ids
+            if normalize_product_id(product_id)
+        )
+    )
+    return product_ids[0] if len(product_ids) == 1 else ""
+
+
+def decide_shop(
+    path: Path,
+    report_type: str,
+    rows: list[list[str]],
+    product_ids: list[str],
+    product_map: dict[str, str],
+    shops: list[str],
+) -> tuple[str, str, str]:
+    explicit_shop, explicit_source = extract_explicit_shop(rows, shops)
+    if explicit_shop:
+        return explicit_shop, explicit_source, ""
+
+    counts = Counter(product_map[product_id] for product_id in product_ids if product_id in product_map)
+    counts_text = ";".join(f"{shop}:{count}" for shop, count in counts.most_common())
+    if counts:
+        top_shop, top_count = counts.most_common(1)[0]
+        second_count = counts.most_common(2)[1][1] if len(counts) > 1 else 0
+        if top_count > second_count:
+            return top_shop, "product_id_map", counts_text
+
+    if report_type == "商品数据":
+        filename_shop, source = extract_shop_from_filename(path, shops)
+        if filename_shop:
+            return filename_shop, source, counts_text
+
+    return "", "", counts_text
+
+
+DATE_PATTERNS = [
+    re.compile(r"(20\d{2})[-/.年](\d{1,2})[-/.月](\d{1,2})"),
+    re.compile(r"\b(20\d{2})(\d{2})(\d{2})\b"),
+    re.compile(r"\b(\d{2})(\d{2})(\d{2})\b"),
+]
+
+
+def parse_date(text: object) -> dt.date | None:
+    value = normalize_text(text)
+    for pattern in DATE_PATTERNS:
+        match = pattern.search(value)
+        if not match:
+            continue
+        parts = match.groups()
+        if len(parts[0]) == 2:
+            year = 2000 + int(parts[0])
+        else:
+            year = int(parts[0])
+        try:
+            return dt.date(year, int(parts[1]), int(parts[2]))
+        except ValueError:
+            continue
+    return None
+
+
+def promotion_column_indices(headers: list[str], signature: Signature) -> tuple[int | None, int | None]:
+    return (
+        find_header_index(headers, signature.period_headers),
+        find_header_index(headers, signature.product_id_headers),
+    )
+
+
+def promotion_effective_column_indices(
+    headers: list[str], signature: Signature
+) -> tuple[int | None, int | None]:
+    """Prefer standardized archive keys while remaining compatible with raw exports."""
+    date_index = find_header_index(headers, [PROMOTION_ARCHIVE_DATE_HEADER])
+    product_id_index = find_header_index(headers, [PROMOTION_ARCHIVE_PRODUCT_ID_HEADER])
+    signature_date_index, signature_product_id_index = promotion_column_indices(
+        headers, signature
+    )
+    return (
+        date_index if date_index is not None else signature_date_index,
+        product_id_index if product_id_index is not None else signature_product_id_index,
+    )
+
+
+def promotion_product_id_for_row(
+    headers: list[str],
+    row: list[str],
+    signature: Signature,
+    fallback_product_id: str = "",
+) -> str:
+    """Resolve a row ID, with one narrow filename-backed export exception."""
+    _date_index, product_id_index = promotion_effective_column_indices(
+        headers, signature
+    )
+    product_id = (
+        normalize_product_id(row[product_id_index])
+        if product_id_index is not None and product_id_index < len(row)
+        else ""
+    )
+    if (
+        not product_id
+        and fallback_product_id
+        and is_pdd_daily_breakdown_signature(signature)
+    ):
+        return normalize_product_id(fallback_product_id)
+    return product_id
+
+
+def promotion_type_for_row(
+    headers: list[str], row: list[str], fallback_signature: Signature
+) -> str:
+    """Resolve the explicit archive type, or safely recover it from an old archive row."""
+    type_index = find_header_index(headers, [PROMOTION_ARCHIVE_TYPE_HEADER])
+    signatures = promotion_signatures()
+    known_types = {signature.promotion_type for signature in signatures if signature.promotion_type}
+    if type_index is not None:
+        promotion_type = normalize_text(row[type_index]) if type_index < len(row) else ""
+        if promotion_type in known_types:
+            return promotion_type
+        if promotion_type:
+            raise RuntimeError(f"推广类型无效：{promotion_type}")
+        raise RuntimeError("推广数据缺少归档推广类型")
+
+    # Old cumulative workbooks did not record the type. Infer it only when one
+    # signature's complete discriminator fields are populated on this row.
+    matched_types: set[str] = set()
+    for signature in signatures:
+        if not signature.promotion_type:
+            continue
+        required_indices = [
+            find_header_index(headers, [required]) for required in signature.required_headers
+        ]
+        if required_indices and all(
+            index is not None and index < len(row) and normalize_text(row[index])
+            for index in required_indices
+        ):
+            matched_types.add(signature.promotion_type)
+    if len(matched_types) == 1:
+        return next(iter(matched_types))
+
+    # A raw source has one promotion signature and does not need row inference.
+    has_archive_keys = (
+        find_header_index(headers, [PROMOTION_ARCHIVE_DATE_HEADER]) is not None
+        and find_header_index(headers, [PROMOTION_ARCHIVE_PRODUCT_ID_HEADER]) is not None
+    )
+    if fallback_signature.promotion_type and not has_archive_keys:
+        return fallback_signature.promotion_type
+    raise RuntimeError("旧归档推广数据无法识别推广类型")
+
+
+def is_ignorable_promotion_row(headers: list[str], row: list[str]) -> bool:
+    values = [normalize_text(value) for value in row]
+    first_cell = values[0] if values else ""
+    normalized_headers = [normalize_text(header) for header in headers]
+    repeated_header = bool(normalized_headers) and (
+        values[: len(normalized_headers)] == normalized_headers
+    )
+    return (
+        repeated_header
+        or first_cell in {"总计", "合计", "汇总"}
+        or first_cell.startswith("注")
+        or first_cell.startswith("说明")
+    )
+
+
+def promotion_preview_missing_fields(
+    rows: list[list[str]],
+    header_row_index: int,
+    headers: list[str],
+    signature: Signature,
+    fallback_product_id: str = "",
+) -> list[str]:
+    date_index, product_id_index = promotion_column_indices(headers, signature)
+    missing: list[str] = []
+    if date_index is None:
+        missing.append("具体日期")
+    has_filename_product_id = bool(
+        normalize_product_id(fallback_product_id)
+        and is_pdd_daily_breakdown_signature(signature)
+    )
+    if product_id_index is None and not has_filename_product_id:
+        missing.append("商品ID")
+    data_rows = 0
+    missing_date = False
+    missing_product_id = False
+    if date_index is not None and (product_id_index is not None or has_filename_product_id):
+        for row in rows[header_row_index + 1 :]:
+            if not any(normalize_text(value) for value in row):
+                continue
+            if is_ignorable_promotion_row(headers, row):
+                continue
+            data_rows += 1
+            if date_index >= len(row) or parse_date(row[date_index]) is None:
+                missing_date = True
+            product_id = (
+                normalize_product_id(row[product_id_index])
+                if product_id_index is not None and product_id_index < len(row)
+                else normalize_product_id(fallback_product_id)
+            )
+            if not product_id:
+                missing_product_id = True
+    if date_index is not None and (product_id_index is not None or has_filename_product_id) and data_rows == 0:
+        missing.append("推广明细")
+    if missing_date:
+        missing.append("具体日期")
+    if missing_product_id:
+        missing.append("商品ID")
+    return list(dict.fromkeys(missing))
+
+
+def scan_promotion_file_full(
+    path: Path, max_cols: int, fallback_product_id: str = ""
+) -> PromotionValidation:
+    data_rows = 0
+    valid_rows = 0
+    missing_date_rows = 0
+    missing_product_id_rows = 0
+    examples: list[str] = []
+
+    for promotion_row in iter_promotion_rows_full(path, max_cols):
+        row = promotion_row.values
+        if is_ignorable_promotion_row(promotion_row.headers, row):
+            continue
+        data_rows += 1
+        date_index, product_id_index = promotion_effective_column_indices(
+            promotion_row.headers, promotion_row.signature
+        )
+        parsed_date = (
+            parse_date(row[date_index])
+            if date_index is not None and date_index < len(row)
+            else None
+        )
+        product_id = promotion_product_id_for_row(
+            promotion_row.headers,
+            row,
+            promotion_row.signature,
+            fallback_product_id,
+        )
+        row_missing: list[str] = []
+        if parsed_date is None:
+            missing_date_rows += 1
+            row_missing.append("具体日期")
+        if not product_id:
+            missing_product_id_rows += 1
+            row_missing.append("商品ID")
+        if row_missing:
+            if len(examples) < 10:
+                examples.append(
+                    f"工作表={promotion_row.sheet_name}，行={promotion_row.row_number}，缺少{'、'.join(row_missing)}"
+                )
+            continue
+        try:
+            promotion_type_for_row(
+                promotion_row.headers, row, promotion_row.signature
+            )
+        except RuntimeError as exc:
+            if len(examples) < 10:
+                examples.append(
+                    f"工作表={promotion_row.sheet_name}，行={promotion_row.row_number}，{exc}"
+                )
+            raise RuntimeError(
+                f"推广数据无法识别推广类型：文件={path}；{'；'.join(examples)}"
+            ) from exc
+        valid_rows += 1
+
+    if data_rows == 0:
+        raise RuntimeError(f"推广文件没有可归档的明细行：{path}")
+    if missing_date_rows or missing_product_id_rows:
+        missing_fields: list[str] = []
+        if missing_date_rows:
+            missing_fields.append("具体日期")
+        if missing_product_id_rows:
+            missing_fields.append("商品ID")
+        raise RuntimeError(
+            f"推广数据缺少{'、'.join(missing_fields)}，请重新下载包含逐行日期和商品ID的推广明细："
+            f"文件={path}；{'；'.join(examples)}"
+        )
+    return PromotionValidation(
+        data_rows=data_rows,
+        valid_rows=valid_rows,
+        missing_date_rows=missing_date_rows,
+        missing_product_id_rows=missing_product_id_rows,
+        examples=examples,
+    )
+
+
+def date_range_from_column(rows: list[list[str]], header_row_index: int, headers: list[str], period_headers: list[str]) -> tuple[str, str] | None:
+    columns = find_header_indices(headers, period_headers)
+    if not columns:
+        return None
+    dates: list[dt.date] = []
+    for row in rows[header_row_index + 1 :]:
+        for _header, column_index in columns:
+            parsed = parse_date(row[column_index]) if column_index < len(row) else None
+            if parsed:
+                dates.append(parsed)
+                break
+    if not dates:
+        return None
+    start = min(dates).isoformat()
+    end = max(dates).isoformat()
+    return start, end
+
+
+def date_range_from_filename(path: Path) -> tuple[str, str] | None:
+    text = path.name
+    match = re.search(r"(20\d{6})\s*至\s*(20\d{6})", text)
+    if match:
+        start = parse_date(match.group(1))
+        end = parse_date(match.group(2))
+        if start and end:
+            return start.isoformat(), end.isoformat()
+    match = re.search(r"(20\d{2}[-.]\d{1,2}[-.]\d{1,2})\s*至\s*(20\d{2}[-.]\d{1,2}[-.]\d{1,2})", text)
+    if match:
+        start = parse_date(match.group(1))
+        end = parse_date(match.group(2))
+        if start and end:
+            return start.isoformat(), end.isoformat()
+    return None
+
+
+def file_creation_datetime(path: Path) -> dt.datetime:
+    stat_result = path.stat()
+    if hasattr(stat_result, "st_birthtime"):
+        timestamp = stat_result.st_birthtime
+    elif os.name == "nt":
+        timestamp = stat_result.st_ctime
+    else:
+        timestamp = stat_result.st_mtime
+    return dt.datetime.fromtimestamp(timestamp)
+
+
+def download_date(path: Path) -> dt.date:
+    return file_creation_datetime(path).date()
+
+
+def download_datetime(path: Path) -> dt.datetime:
+    return file_creation_datetime(path)
+
+
+def decide_period(
+    path: Path,
+    signature: Signature,
+    rows: list[list[str]],
+    header_row_index: int,
+    headers: list[str],
+    file_download_date: dt.date,
+) -> tuple[str, str]:
+    if signature.period_mode == "download_date":
+        return file_download_date.isoformat(), "download_date"
+
+    if signature.period_mode == "filename_range_then_date_column":
+        column_range = date_range_from_column(rows, header_row_index, headers, signature.period_headers)
+        if column_range:
+            return f"{column_range[0]}至{column_range[1]}", "date_column"
+        return "", ""
+
+    column_range = date_range_from_column(rows, header_row_index, headers, signature.period_headers)
+    if column_range:
+        return f"{column_range[0]}至{column_range[1]}", "date_column"
+    return "", ""
+
+
+def period_date_range(period: str) -> tuple[str, str] | None:
+    match = re.fullmatch(r"(20\d{2}-\d{2}-\d{2})至(20\d{2}-\d{2}-\d{2})", normalize_text(period))
+    if not match:
+        return None
+    return match.group(1), match.group(2)
+
+
+def is_daily_breakdown_promotion(
+    report_type: str,
+    rows: list[list[str]],
+    header_row_index: int,
+    headers: list[str],
+    period_headers: list[str],
+    product_id_headers: list[str],
+    fallback_product_id: str = "",
+) -> bool:
+    # Whether a promotion export can be archived is determined by its data,
+    # not by a filename convention. Tmall exports often combine daily rows
+    # without including "分天数据" in the filename.
+    if report_type != "推广数据":
+        return False
+
+    date_column_index = find_header_index(headers, period_headers)
+    product_id_column_index = find_header_index(headers, product_id_headers)
+    normalized_fallback_product_id = normalize_product_id(fallback_product_id)
+    if date_column_index is None or (
+        product_id_column_index is None and not normalized_fallback_product_id
+    ):
+        return False
+
+    dates: list[dt.date] = []
+    data_row_count = 0
+    for row in rows[header_row_index + 1 :]:
+        if not any(normalize_text(value) for value in row):
+            continue
+        first_cell = normalize_text(row[0]) if row else ""
+        if first_cell in {"总计", "合计"} or first_cell.startswith("注"):
+            continue
+        data_row_count += 1
+        if date_column_index >= len(row):
+            return False
+        parsed = parse_date(row[date_column_index])
+        if not parsed:
+            return False
+        product_id = (
+            normalize_product_id(row[product_id_column_index])
+            if product_id_column_index is not None and product_id_column_index < len(row)
+            else normalized_fallback_product_id
+        )
+        if not product_id:
+            return False
+        dates.append(parsed)
+
+    return data_row_count > 0 and len(set(dates)) > 1
+
+
+def is_multi_day_promotion_summary(
+    path: Path,
+    report_type: str,
+    period: str,
+    rows: list[list[str]],
+    header_row_index: int,
+    headers: list[str],
+    period_headers: list[str],
+    product_id_headers: list[str],
+    fallback_product_id: str = "",
+) -> bool:
+    if report_type != "推广数据":
+        return False
+    date_range = period_date_range(period)
+    if not date_range or date_range[0] == date_range[1]:
+        return False
+    return not is_daily_breakdown_promotion(
+        report_type,
+        rows,
+        header_row_index,
+        headers,
+        period_headers,
+        product_id_headers,
+        fallback_product_id,
+    )
+
+
+def sanitize_filename_part(value: str) -> str:
+    value = normalize_text(value)
+    for char in INVALID_FILENAME_CHARS:
+        value = value.replace(char, "_")
+    value = re.sub(r"\s+", " ", value).strip(" .")
+    return value or "未知"
+
+
+def product_ids_filename_part(product_ids: list[str]) -> str:
+    unique_ids = list(dict.fromkeys(product_ids))
+    if not unique_ids:
+        return "未知商品ID"
+    if len(unique_ids) == 1:
+        return unique_ids[0]
+    preview = "+".join(unique_ids[:3])
+    if len(unique_ids) > 3:
+        preview += f"等{len(unique_ids)}个"
+    return preview
+
+
+def promotion_data_folder(database_root: Path, shop_name: str) -> Path:
+    return (
+        database_root
+        / PROMOTION_DATABASE_DIR
+        / sanitize_filename_part(shop_name)
+    )
+
+
+def promotion_data_filename(shop_name: str) -> str:
+    return f"{sanitize_filename_part(shop_name)}—{PROMOTION_DATA_PREFIX}.xlsx"
+
+
+def promotion_data_existing_paths(target_path: Path) -> list[Path]:
+    return [target_path] if target_path.exists() else []
+
+
+def promotion_adjustment_update_date(period: str, fallback_date: dt.date) -> str:
+    date_range = period_date_range(period)
+    if date_range:
+        return date_range[1]
+    parsed = parse_date(period)
+    return parsed.isoformat() if parsed else fallback_date.isoformat()
+
+
+def promotion_adjustment_filename(shop_name: str, product_id_part: str, update_date: str) -> str:
+    return "—".join(
+        [
+            sanitize_filename_part(shop_name),
+            sanitize_filename_part(product_id_part),
+            sanitize_filename_part(f"{PROMOTION_ADJUSTMENT_UPDATE_PREFIX}{update_date}"),
+        ]
+    )
+
+
+def promotion_adjustment_existing_paths(target_dir: Path, shop_name: str, product_id_part: str) -> list[Path]:
+    if not target_dir.exists():
+        return []
+    prefix = "—".join([sanitize_filename_part(shop_name), sanitize_filename_part(product_id_part), ""])
+    return sorted(
+        path
+        for path in target_dir.iterdir()
+        if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS and path.name.startswith(prefix)
+    )
+
+
+def after_sale_update_date(period: str, fallback_date: dt.date) -> str:
+    date_range = period_date_range(period)
+    if date_range:
+        return date_range[1]
+    parsed = parse_date(period)
+    return parsed.isoformat() if parsed else fallback_date.isoformat()
+
+
+def after_sale_filename(shop_name: str, update_date: str) -> str:
+    return "—".join(
+        [
+            sanitize_filename_part(shop_name),
+            sanitize_filename_part(f"{AFTER_SALE_UPDATE_PREFIX}{update_date}"),
+        ]
+    )
+
+
+def after_sale_existing_paths(target_dir: Path) -> list[Path]:
+    if not target_dir.exists():
+        return []
+    return sorted(
+        path
+        for path in target_dir.iterdir()
+        if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS
+    )
+
+
+def order_month_key_from_date(value: object) -> str:
+    parsed = parse_datetime_text(value)
+    return parsed.strftime("%Y-%m") if parsed else ""
+
+
+def order_month_label(month_key: str) -> tuple[int, int]:
+    year, month = month_key.split("-", 1)
+    return int(year), int(month)
+
+
+def order_data_folder(database_root: Path, shop_name: str, month_key: str) -> Path:
+    year, month = order_month_label(month_key)
+    return (
+        database_root
+        / ORDER_DATABASE_DIR
+        / sanitize_filename_part(shop_name)
+        / f"{year}年"
+        / f"{month}月（成交时间）"
+    )
+
+
+def order_data_filename(shop_name: str, month_key: str) -> str:
+    year, month = order_month_label(month_key)
+    return "—".join(
+        [
+            sanitize_filename_part(shop_name),
+            sanitize_filename_part(f"{ORDER_DATA_PREFIX}{year}年{month:02d}月"),
+        ]
+    )
+
+
+def order_data_existing_paths(target_dir: Path) -> list[Path]:
+    if not target_dir.exists():
+        return []
+    return sorted(
+        path
+        for path in target_dir.iterdir()
+        if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS and not is_order_summary_file(path)
+    )
+
+
+def order_source_datetime(path: Path) -> dt.datetime:
+    return download_datetime(path)
+
+
+def is_cumulative_order_source_name(value: object) -> bool:
+    source_name = normalize_text(value)
+    if not source_name:
+        return False
+    return bool(
+        re.search(
+            rf"{re.escape(ORDER_DATA_PREFIX)}20\d{{2}}年\d{{1,2}}月(?:_第\d+部分)?",
+            Path(source_name).name,
+        )
+    )
+
+
+def saved_order_source_datetime(
+    record: dict[str, str], cumulative_path: Path
+) -> dt.datetime | None:
+    saved_time = parse_datetime_text(record.get("汇总_最新下载时间", ""))
+    saved_source = Path(normalize_text(record.get("汇总_最新来源文件", ""))).name
+    saved_archive = Path(normalize_text(record.get("汇总_最新归档文件", ""))).name
+    if saved_time is None or not saved_source:
+        return None
+    if (
+        saved_source == cumulative_path.name
+        or (saved_archive and saved_source == saved_archive)
+        or is_cumulative_order_source_name(saved_source)
+    ):
+        return None
+    return saved_time
+
+
+def parse_datetime_text(value: object) -> dt.datetime | None:
+    text = normalize_text(value)
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y/%m/%d %H:%M:%S", "%Y/%m/%d %H:%M"):
+        try:
+            return dt.datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    parsed_date = parse_date(text)
+    return dt.datetime.combine(parsed_date, dt.time.min) if parsed_date else None
+
+
+def is_ignorable_order_row(row: list[str]) -> bool:
+    first_cell = normalize_text(row[0]) if row else ""
+    return (
+        first_cell in {"总计", "合计", "汇总"}
+        or first_cell.startswith("注")
+        or first_cell.startswith("说明")
+    )
+
+
+def is_explicit_unpaid_or_cancelled_order(headers: list[str], row: list[str]) -> bool:
+    for index, header in enumerate(headers):
+        if normalize_text(header) not in ORDER_STATUS_HEADERS:
+            continue
+        status = normalize_text(row[index]) if index < len(row) else ""
+        if any(keyword in status for keyword in UNPAID_OR_CANCELLED_STATUS_KEYWORDS):
+            return True
+    return False
+
+
+def resolve_order_row_datetime(
+    headers: list[str], row: list[str]
+) -> tuple[dt.datetime | None, str, str]:
+    return resolve_order_row_datetime_from_columns(
+        row, order_time_columns(headers)
+    )
+
+
+def resolve_order_row_datetime_from_columns(
+    row: list[str], time_columns: list[tuple[str, int]]
+) -> tuple[dt.datetime | None, str, str]:
+    raw_values: list[str] = []
+    for header, column_index in time_columns:
+        raw_value = normalize_text(row[column_index]) if column_index < len(row) else ""
+        raw_values.append(f"{header}={raw_value or '空'}")
+        parsed = parse_datetime_text(raw_value)
+        if parsed is not None:
+            return parsed, header, "；".join(raw_values)
+    return None, "", "；".join(raw_values) or "未找到订单时间列"
+
+
+def order_row_record(headers: list[str], row: list[str]) -> dict[str, str]:
+    return {
+        normalize_text(header): normalize_text(row[index]) if index < len(row) else ""
+        for index, header in enumerate(headers)
+        if normalize_text(header)
+    }
+
+
+def conflicting_order_fields(
+    old_headers: list[str],
+    old_row: list[str],
+    new_headers: list[str],
+    new_row: list[str],
+    limit: int = 8,
+) -> str:
+    old_record = order_row_record(old_headers, old_row)
+    new_record = order_row_record(new_headers, new_row)
+    differences: list[str] = []
+    ordered_headers: list[str] = []
+    append_headers(ordered_headers, old_record)
+    append_headers(ordered_headers, new_record)
+    for header in ordered_headers:
+        old_value = normalize_text(old_record.get(header, ""))
+        new_value = normalize_text(new_record.get(header, ""))
+        if old_value != new_value:
+            differences.append(
+                f"{header}={old_value or '空'}→{new_value or '空'}"
+            )
+        if len(differences) >= limit:
+            break
+    return "；".join(differences) or "行内容不一致"
+
+
+def scan_order_file_full(path: Path, max_cols: int) -> OrderFileScan:
+    month_keys: set[str] = set()
+    order_ids: set[str] = set()
+    alias_ids: set[str] = set()
+    main_children: dict[str, set[str]] = {}
+    fallback_main_rows: dict[str, list[str]] = {}
+    seen_order_rows: dict[str, tuple[OrderRow, tuple[tuple[str, str], ...]]] = {}
+    conflict_examples: list[str] = []
+    conflict_count = 0
+    read_rows = 0
+    valid_rows = 0
+    ignored_rows = 0
+    invalid_id_examples: list[str] = []
+    invalid_id_count = 0
+    invalid_examples: list[str] = []
+    invalid_count = 0
+    for order_row in iter_order_rows_full(path, max_cols):
+        row_number = order_row.row_number
+        row = order_row.values
+        if not any(normalize_text(cell) for cell in row):
+            continue
+        read_rows += 1
+        if is_ignorable_order_row(row):
+            ignored_rows += 1
+            continue
+        order_id, _selected_id_header, raw_id_values = resolve_order_id_from_columns(
+            row, order_row.id_columns
+        )
+        if not order_id:
+            invalid_id_count += 1
+            if len(invalid_id_examples) < 10:
+                invalid_id_examples.append(
+                    f"工作表={order_row.sheet_name}，行={row_number}，编号字段={raw_id_values}"
+                )
+            continue
+        (
+            _primary_id,
+            child_id,
+            main_id,
+            _pdd_order_id,
+            row_aliases,
+        ) = order_identifier_values(row, order_row.id_columns)
+        alias_ids.update(row_aliases)
+        if main_id:
+            if child_id:
+                main_children.setdefault(main_id, set()).add(child_id)
+            else:
+                fallback_main_rows.setdefault(main_id, []).append(
+                    f"{order_row.sheet_name}!{row_number}"
+                )
+
+        fingerprint = tuple(sorted(order_row_record(order_row.headers, row).items()))
+        previous = seen_order_rows.get(order_id)
+        if previous is None:
+            seen_order_rows[order_id] = (order_row, fingerprint)
+        elif previous[1] != fingerprint:
+            conflict_count += 1
+            if len(conflict_examples) < 10:
+                previous_row = previous[0]
+                conflict_examples.append(
+                    f"订单号={order_id}，首次={previous_row.sheet_name}!{previous_row.row_number}，"
+                    f"再次={order_row.sheet_name}!{row_number}，差异="
+                    f"{conflicting_order_fields(previous_row.headers, previous_row.values, order_row.headers, row)}"
+                )
+
+        parsed_time, _selected_header, raw_values = resolve_order_row_datetime_from_columns(
+            row, order_row.time_columns
+        )
+        if parsed_time is None:
+            if is_explicit_unpaid_or_cancelled_order(order_row.headers, row):
+                ignored_rows += 1
+                continue
+            invalid_count += 1
+            if len(invalid_examples) < 10:
+                invalid_examples.append(
+                    f"工作表={order_row.sheet_name}，行={row_number}，"
+                    f"订单号={order_id}，时间字段={raw_values}"
+                )
+            continue
+        valid_rows += 1
+        month_keys.add(parsed_time.strftime("%Y-%m"))
+        order_ids.add(order_id)
+
+    if conflict_count:
+        raise RuntimeError(
+            f"同一订单编号存在内容冲突，共{conflict_count}处；"
+            f"{'；'.join(conflict_examples)}。停止整理，请用户确认冲突行：{path}"
+        )
+    ambiguous_main_ids = {
+        main_id for main_id, child_ids in main_children.items() if len(child_ids) > 1
+    }
+    ambiguous_fallbacks = sorted(ambiguous_main_ids & set(fallback_main_rows))
+    if ambiguous_fallbacks:
+        examples = "；".join(
+            f"主订单编号={main_id}，子订单编号={','.join(sorted(main_children[main_id]))}，"
+            f"无子订单编号行={','.join(fallback_main_rows[main_id])}"
+            for main_id in ambiguous_fallbacks[:10]
+        )
+        raise RuntimeError(
+            f"天猫主订单编号无法唯一对应子订单，共{len(ambiguous_fallbacks)}组；"
+            f"{examples}。停止整理，请用户确认：{path}"
+        )
+    if invalid_id_count:
+        examples = "；".join(invalid_id_examples)
+        raise RuntimeError(
+            f"订单编号为空，共{invalid_id_count}行；{examples}。"
+            f"停止整理，不生成或覆盖月表，并保留源文件：{path}"
+        )
+    if invalid_count:
+        examples = "；".join(invalid_examples)
+        raise RuntimeError(
+            f"订单时间无法识别，共{invalid_count}行；{examples}。"
+            f"停止整理，不生成或覆盖月表，并保留源文件：{path}"
+        )
+    if read_rows != valid_rows + ignored_rows:
+        raise RuntimeError(
+            f"订单行数核对失败：读取={read_rows}，有效={valid_rows}，"
+            f"忽略说明/合计={ignored_rows}；停止整理并保留源文件：{path}"
+        )
+    if not month_keys:
+        raise RuntimeError(f"订单文件没有有效订单行，停止整理并保留源文件：{path}")
+    return OrderFileScan(
+        month_keys,
+        order_ids,
+        alias_ids,
+        ambiguous_main_ids,
+        read_rows,
+        valid_rows,
+        ignored_rows,
+    )
+
+
+def order_shop_existing_paths(database_root: Path, shop_name: str) -> list[Path]:
+    shop_root = (
+        database_root
+        / ORDER_REPORT_TYPE
+        / sanitize_filename_part(shop_name)
+    )
+    if not shop_root.exists():
+        return []
+    return sorted(
+        (
+            path
+            for path in shop_root.rglob("*")
+            if path.is_file()
+            and path.suffix.lower() in SUPPORTED_EXTENSIONS
+            and is_cumulative_order_source_name(path.name)
+        ),
+        key=lambda item: str(item),
+    )
+
+
+def order_merge_paths_full(
+    analysis: Analysis, database_root: Path, max_cols: int
+) -> tuple[list[Path], OrderFileScan]:
+    source_scan = scan_order_file_full(analysis.source, max_cols)
+    target_dirs = {
+        order_data_folder(database_root, analysis.shop_name, month_key).resolve()
+        for month_key in source_scan.month_keys
+    }
+    paths_by_month_dir: dict[Path, list[Path]] = {}
+    for path in order_shop_existing_paths(database_root, analysis.shop_name):
+        paths_by_month_dir.setdefault(path.parent.resolve(), []).append(path)
+
+    impacted_dirs = set(target_dirs & set(paths_by_month_dir))
+    for month_dir, paths in paths_by_month_dir.items():
+        if month_dir in impacted_dirs:
+            continue
+        for path in paths:
+            existing_scan = scan_order_file_full(path, max_cols)
+            if source_scan.alias_ids & existing_scan.alias_ids:
+                impacted_dirs.add(month_dir)
+                break
+
+    existing_paths = {
+        path
+        for month_dir in impacted_dirs
+        for path in paths_by_month_dir.get(month_dir, [])
+    }
+    merge_paths = sorted(existing_paths, key=lambda item: str(item))
+    merge_paths.append(analysis.source)
+    return merge_paths, source_scan
+
+
+def validate_order_merge_inputs(
+    analyses: list[Analysis], database_root: Path, max_cols: int
+) -> None:
+    checked: set[Path] = set()
+    for analysis in analyses:
+        if analysis.status != "ready" or analysis.report_type != ORDER_REPORT_TYPE:
+            continue
+        merge_paths, _source_scan = order_merge_paths_full(analysis, database_root, max_cols)
+        for path in merge_paths:
+            resolved = path.resolve()
+            if resolved in checked:
+                continue
+            scan_order_file_full(path, max_cols)
+            checked.add(resolved)
+    if checked:
+        print(f"order input integrity preflight passed: files={len(checked)}")
+
+
+def validate_promotion_merge_inputs(analyses: list[Analysis], max_cols: int) -> None:
+    checked: set[Path] = set()
+    for analysis in analyses:
+        if analysis.status != "ready" or analysis.report_type != PROMOTION_REPORT_TYPE:
+            continue
+        resolved = analysis.source.resolve()
+        if resolved in checked:
+            continue
+        fallback_product_id = promotion_analysis_fallback_product_id(analysis)
+        scan_promotion_file_full(
+            analysis.source, max_cols, fallback_product_id=fallback_product_id
+        )
+        checked.add(resolved)
+    if checked:
+        print(f"promotion input integrity preflight passed: files={len(checked)}")
+
+
+def create_order_merge_database(path: Path) -> sqlite3.Connection:
+    connection = sqlite3.connect(path)
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("PRAGMA synchronous=NORMAL")
+    connection.execute(
+        """
+        CREATE TABLE order_records (
+            month_key TEXT NOT NULL,
+            order_id TEXT NOT NULL,
+            sort_time TEXT NOT NULL,
+            source_time TEXT NOT NULL,
+            record_json TEXT NOT NULL,
+            PRIMARY KEY (order_id)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE order_aliases (
+            alias_type TEXT NOT NULL,
+            alias_id TEXT NOT NULL,
+            order_id TEXT NOT NULL,
+            PRIMARY KEY (alias_type, alias_id, order_id)
+        )
+        """
+    )
+    connection.execute(
+        "CREATE INDEX order_alias_lookup ON order_aliases(alias_type, alias_id)"
+    )
+    return connection
+
+
+def order_alias_matches(
+    connection: sqlite3.Connection, alias_type: str, alias_id: str
+) -> list[str]:
+    if not alias_id:
+        return []
+    return [
+        normalize_text(row[0])
+        for row in connection.execute(
+            "SELECT order_id FROM order_aliases "
+            "WHERE alias_type=? AND alias_id=? ORDER BY order_id",
+            (alias_type, alias_id),
+        ).fetchall()
+    ]
+
+
+def order_record_child_id(connection: sqlite3.Connection, order_id: str) -> str:
+    row = connection.execute(
+        "SELECT record_json FROM order_records WHERE order_id=?", (order_id,)
+    ).fetchone()
+    if row is None:
+        return ""
+    record = json.loads(row[0])
+    return normalize_text(record.get("子订单编号", ""))
+
+
+def resolve_existing_order_alias(
+    connection: sqlite3.Connection,
+    child_id: str,
+    main_id: str,
+    pdd_order_id: str,
+    ambiguous_main_ids: set[str],
+    path: Path,
+    sheet_name: str,
+    row_number: int,
+) -> str:
+    location = f"文件={path}，工作表={sheet_name}，行={row_number}"
+    if pdd_order_id:
+        matches = order_alias_matches(connection, "pdd", pdd_order_id)
+        if len(matches) > 1:
+            raise RuntimeError(
+                f"拼多多订单号对应多条历史订单：{location}，订单号={pdd_order_id}，"
+                f"匹配={','.join(matches)}；停止整理，请用户确认。"
+            )
+        return matches[0] if matches else ""
+
+    child_matches = order_alias_matches(connection, "tmall_child", child_id)
+    if len(child_matches) > 1:
+        raise RuntimeError(
+            f"天猫子订单编号对应多条历史订单：{location}，子订单编号={child_id}，"
+            f"匹配={','.join(child_matches)}；停止整理，请用户确认。"
+        )
+    main_matches = order_alias_matches(connection, "tmall_main", main_id)
+    fallback_origin_matches = order_alias_matches(
+        connection, "tmall_fallback_main", main_id
+    )
+    unresolved_fallbacks = [
+        order_id
+        for order_id in fallback_origin_matches
+        if not order_record_child_id(connection, order_id)
+    ]
+    assigned_fallbacks = [
+        order_id
+        for order_id in fallback_origin_matches
+        if order_record_child_id(connection, order_id)
+    ]
+
+    if child_matches:
+        unrelated_fallbacks = [
+            order_id
+            for order_id in fallback_origin_matches
+            if order_id != child_matches[0]
+        ]
+        if unrelated_fallbacks:
+            raise RuntimeError(
+                f"天猫主、子订单历史关系冲突：{location}，主订单编号={main_id}，"
+                f"子订单编号={child_id}，未归属旧记录={','.join(unrelated_fallbacks)}；"
+                "停止整理，请用户确认。"
+            )
+        return child_matches[0]
+
+    if child_id:
+        if assigned_fallbacks:
+            raise RuntimeError(
+                f"天猫旧主订单已归属其他子订单：{location}，主订单编号={main_id}，"
+                f"当前子订单编号={child_id}，已归属记录={','.join(assigned_fallbacks)}；"
+                "停止整理，请用户确认。"
+            )
+        if unresolved_fallbacks:
+            if len(unresolved_fallbacks) > 1 or main_id in ambiguous_main_ids:
+                raise RuntimeError(
+                    f"天猫主订单编号无法唯一回退到子订单：{location}，"
+                    f"主订单编号={main_id}，子订单编号={child_id}，"
+                    f"旧记录={','.join(unresolved_fallbacks)}；停止整理，请用户确认。"
+                )
+            return unresolved_fallbacks[0]
+        return ""
+
+    if len(main_matches) > 1:
+        raise RuntimeError(
+            f"天猫主订单编号对应多个子订单：{location}，主订单编号={main_id}，"
+            f"匹配={','.join(main_matches)}；当前行没有子订单编号，停止整理，请用户确认。"
+        )
+    return main_matches[0] if main_matches else ""
+
+
+def register_order_aliases(
+    connection: sqlite3.Connection,
+    order_id: str,
+    child_id: str,
+    main_id: str,
+    pdd_order_id: str,
+) -> None:
+    aliases = [
+        ("tmall_child", child_id),
+        ("tmall_main", main_id),
+        ("tmall_fallback_main", main_id if main_id and not child_id else ""),
+        ("pdd", pdd_order_id),
+    ]
+    for alias_type, alias_id in aliases:
+        if alias_id:
+            connection.execute(
+                "INSERT OR IGNORE INTO order_aliases(alias_type, alias_id, order_id) "
+                "VALUES (?, ?, ?)",
+                (alias_type, alias_id, order_id),
+            )
+
+
+def rename_order_record(
+    connection: sqlite3.Connection, old_order_id: str, new_order_id: str
+) -> None:
+    if not new_order_id or old_order_id == new_order_id:
+        return
+    if connection.execute(
+        "SELECT 1 FROM order_records WHERE order_id=?", (new_order_id,)
+    ).fetchone():
+        raise RuntimeError(
+            f"订单主键转换冲突：旧订单号={old_order_id}，新订单号={new_order_id}；"
+            "停止整理，请用户确认。"
+        )
+    aliases = connection.execute(
+        "SELECT alias_type, alias_id FROM order_aliases WHERE order_id=?",
+        (old_order_id,),
+    ).fetchall()
+    connection.execute(
+        "UPDATE order_records SET order_id=? WHERE order_id=?",
+        (new_order_id, old_order_id),
+    )
+    connection.execute("DELETE FROM order_aliases WHERE order_id=?", (old_order_id,))
+    for alias_type, alias_id in aliases:
+        connection.execute(
+            "INSERT OR IGNORE INTO order_aliases(alias_type, alias_id, order_id) "
+            "VALUES (?, ?, ?)",
+            (alias_type, alias_id, new_order_id),
+        )
+
+
+def load_order_merge_database(
+    connection: sqlite3.Connection,
+    paths: list[Path],
+    current_source: Path,
+    shop_name: str,
+    max_cols: int,
+) -> tuple[dict[str, list[str]], int, int, int, int]:
+    month_headers: dict[str, list[str]] = {}
+    total_read = 0
+    total_valid = 0
+    total_ignored = 0
+    duplicate_rows = 0
+    pending_writes = 0
+
+    for path in paths:
+        path_scan = scan_order_file_full(path, max_cols)
+        is_current_source = path.resolve() == current_source.resolve()
+        current_file_creation_time = (
+            file_creation_datetime(path).strftime("%Y-%m-%d %H:%M:%S")
+            if is_current_source
+            else ""
+        )
+        path_read = 0
+        path_valid = 0
+        path_ignored = 0
+        supplementary_price_rows = 0
+
+        for order_row in iter_order_rows_full(path, max_cols):
+            row_number = order_row.row_number
+            row = order_row.values
+            headers = order_row.headers
+            if not any(normalize_text(cell) for cell in row):
+                continue
+            path_read += 1
+            if is_ignorable_order_row(row):
+                path_ignored += 1
+                continue
+            order_id, _selected_id_header, raw_id_values = resolve_order_id_from_columns(
+                row, order_row.id_columns
+            )
+            if not order_id:
+                raise RuntimeError(
+                    f"订单编号为空：文件={path}，工作表={order_row.sheet_name}，行={row_number}，"
+                    f"编号字段={raw_id_values}；停止整理并保留源文件。"
+                )
+            (
+                _primary_id,
+                child_id,
+                main_id,
+                pdd_order_id,
+                _row_aliases,
+            ) = order_identifier_values(row, order_row.id_columns)
+            parsed_time, _selected_header, raw_values = resolve_order_row_datetime_from_columns(
+                row, order_row.time_columns
+            )
+            if parsed_time is None:
+                if is_explicit_unpaid_or_cancelled_order(headers, row):
+                    path_ignored += 1
+                    continue
+                raise RuntimeError(
+                    f"订单时间无法识别：文件={path}，工作表={order_row.sheet_name}，行={row_number}，"
+                    f"订单号={order_id}，时间字段={raw_values}；"
+                    "停止整理并保留源文件。"
+                )
+            path_valid += 1
+            month_key = parsed_time.strftime("%Y-%m")
+            final_headers = month_headers.setdefault(month_key, [])
+            append_headers(
+                final_headers,
+                [header for header in headers if header not in ORDER_SUMMARY_METADATA_HEADERS],
+            )
+            append_headers(final_headers, ORDER_SALES_MARK_HEADERS)
+            append_headers(final_headers, ORDER_SUMMARY_METADATA_HEADERS)
+            record = row_to_dict(headers, row)
+            classification = apply_order_sales_marks(record)
+            if classification.is_supplementary_price:
+                supplementary_price_rows += 1
+            if is_current_source:
+                source_time = current_file_creation_time
+                record["汇总_最新下载时间"] = source_time
+                record["汇总_最新来源文件"] = path.name
+            else:
+                saved_source_time = saved_order_source_datetime(record, path)
+                source_time = (
+                    saved_source_time.strftime("%Y-%m-%d %H:%M:%S")
+                    if saved_source_time
+                    else ""
+                )
+            record["汇总_店铺名称"] = shop_name
+            record["汇总_最新归档文件"] = ""
+            record_json = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
+            existing_order_id = resolve_existing_order_alias(
+                connection,
+                child_id,
+                main_id,
+                pdd_order_id,
+                path_scan.ambiguous_main_ids,
+                path,
+                order_row.sheet_name,
+                row_number,
+            )
+            if not existing_order_id:
+                connection.execute(
+                    "INSERT INTO order_records "
+                    "(month_key, order_id, sort_time, source_time, record_json) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (month_key, order_id, parsed_time.isoformat(), source_time, record_json),
+                )
+                register_order_aliases(
+                    connection, order_id, child_id, main_id, pdd_order_id
+                )
+            else:
+                duplicate_rows += 1
+                old_row = connection.execute(
+                    "SELECT month_key, sort_time, source_time, record_json "
+                    "FROM order_records WHERE order_id=?",
+                    (existing_order_id,),
+                ).fetchone()
+                if old_row is None:
+                    raise RuntimeError(
+                        f"订单去重记录读取失败：订单号={existing_order_id}"
+                    )
+                old_month_key, old_sort_time, old_source_time, old_record_json = old_row
+                old_record = json.loads(old_record_json)
+                merged_headers: list[str] = []
+                append_headers(merged_headers, month_headers.get(old_month_key, []))
+                append_headers(merged_headers, final_headers)
+                append_headers(merged_headers, ORDER_SUMMARY_METADATA_HEADERS)
+                if source_time >= old_source_time:
+                    merged_record = merge_order_summary_record(
+                        old_record, record, merged_headers
+                    )
+                    latest_month_key = month_key
+                    latest_sort_time = parsed_time.isoformat()
+                    latest_source_time = source_time
+                else:
+                    merged_record = merge_order_summary_record(
+                        record, old_record, merged_headers
+                    )
+                    latest_month_key = old_month_key
+                    latest_sort_time = old_sort_time
+                    latest_source_time = old_source_time
+                append_headers(
+                    month_headers.setdefault(latest_month_key, []), merged_headers
+                )
+                connection.execute(
+                    "UPDATE order_records SET month_key=?, sort_time=?, source_time=?, "
+                    "record_json=? WHERE order_id=?",
+                    (
+                        latest_month_key,
+                        latest_sort_time,
+                        latest_source_time,
+                        json.dumps(merged_record, ensure_ascii=False, separators=(",", ":")),
+                        existing_order_id,
+                    ),
+                )
+                merged_child_id = normalize_text(
+                    merged_record.get("子订单编号", "")
+                )
+                canonical_order_id = merged_child_id or existing_order_id
+                rename_order_record(
+                    connection, existing_order_id, canonical_order_id
+                )
+                register_order_aliases(
+                    connection,
+                    canonical_order_id,
+                    child_id,
+                    main_id,
+                    pdd_order_id,
+                )
+            pending_writes += 1
+            if pending_writes >= STREAM_COMMIT_INTERVAL:
+                connection.commit()
+                pending_writes = 0
+
+        if path_read != path_valid + path_ignored:
+            raise RuntimeError(
+                f"订单行数核对失败：文件={path}，读取={path_read}，"
+                f"有效={path_valid}，忽略={path_ignored}"
+            )
+        total_read += path_read
+        total_valid += path_valid
+        total_ignored += path_ignored
+        if supplementary_price_rows:
+            print(
+                "supplementary-price order lines:",
+                "已识别为补差价，不计销售",
+                f"file={path}",
+                f"rows={supplementary_price_rows}",
+            )
+
+    connection.commit()
+    unique_rows = int(connection.execute("SELECT COUNT(*) FROM order_records").fetchone()[0])
+    if total_valid - duplicate_rows != unique_rows:
+        raise RuntimeError(
+            f"订单去重核对失败：有效={total_valid}，重复={duplicate_rows}，唯一={unique_rows}"
+        )
+    return month_headers, total_read, total_valid, total_ignored, duplicate_rows
+
+
+def order_output_part_paths(
+    base_path: Path, total_rows: int, max_data_rows: int = EXCEL_MAX_DATA_ROWS
+) -> list[Path]:
+    if total_rows <= max_data_rows:
+        return [base_path]
+    part_count = math.ceil(total_rows / max_data_rows)
+    width = max(2, len(str(part_count)))
+    return [
+        base_path.with_name(
+            f"{base_path.stem}_第{part_number:0{width}d}部分{base_path.suffix}"
+        )
+        for part_number in range(1, part_count + 1)
+    ]
+
+
+def stage_order_outputs(
+    connection: sqlite3.Connection,
+    month_headers: dict[str, list[str]],
+    shop_name: str,
+    database_root: Path,
+    staging_dir: Path,
+    max_data_rows: int = EXCEL_MAX_DATA_ROWS,
+) -> list[tuple[Path, Path, int]]:
+    try:
+        from openpyxl import Workbook
+    except ImportError as exc:  # pragma: no cover - environment specific
+        raise RuntimeError("openpyxl is required to write merged order data") from exc
+
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    staged_outputs: list[tuple[Path, Path, int]] = []
+    for month_key in sorted(month_headers):
+        headers = month_headers[month_key]
+        total_rows = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM order_records WHERE month_key=?", (month_key,)
+            ).fetchone()[0]
+        )
+        if total_rows == 0:
+            continue
+        base_path = order_data_folder(database_root, shop_name, month_key) / (
+            f"{order_data_filename(shop_name, month_key)}.xlsx"
+        )
+        final_paths = order_output_part_paths(base_path, total_rows, max_data_rows)
+        records = connection.execute(
+            "SELECT record_json FROM order_records WHERE month_key=? "
+            "ORDER BY sort_time DESC, order_id",
+            (month_key,),
+        )
+        remaining = total_rows
+        month_written = 0
+        for final_path in final_paths:
+            part_rows = min(max_data_rows, remaining)
+            staged_path = staging_dir / final_path.name
+            workbook = Workbook(write_only=True)
+            worksheet = workbook.create_sheet("订单数据")
+            worksheet.freeze_panes = "A2"
+            worksheet.append(headers)
+            written = 0
+            for _ in range(part_rows):
+                database_row = records.fetchone()
+                if database_row is None:
+                    workbook.close()
+                    raise RuntimeError(
+                        f"订单输出提前结束：月份={month_key}，预计={total_rows}，已写={month_written}"
+                    )
+                record = json.loads(database_row[0])
+                record["汇总_最新归档文件"] = final_path.name
+                worksheet.append([normalize_text(record.get(header, "")) for header in headers])
+                written += 1
+                month_written += 1
+            workbook.save(staged_path)
+            workbook.close()
+            staged_outputs.append((staged_path, final_path, written))
+            remaining -= written
+        if month_written != total_rows or remaining != 0:
+            raise RuntimeError(
+                f"订单输出行数核对失败：月份={month_key}，数据库={total_rows}，写入={month_written}"
+            )
+    return staged_outputs
+
+
+def commit_order_outputs(
+    staged_outputs: list[tuple[Path, Path, int]],
+    old_paths: Iterable[Path],
+    source_path: Path,
+    backup_dir: Path,
+) -> None:
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    backups: list[tuple[Path, Path]] = []
+    installed: list[Path] = []
+    source_backup = backup_dir / "source" / source_path.name
+    source_moved = False
+    try:
+        for index, old_path in enumerate(sorted(set(old_paths), key=lambda item: str(item))):
+            if not old_path.exists():
+                continue
+            backup_path = backup_dir / f"{index:04d}_{old_path.name}"
+            os.replace(old_path, backup_path)
+            backups.append((backup_path, old_path))
+        source_backup.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(source_path, source_backup)
+        source_moved = True
+        for staged_path, final_path, _row_count in staged_outputs:
+            final_path.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(staged_path, final_path)
+            installed.append(final_path)
+    except Exception:
+        for final_path in installed:
+            final_path.unlink(missing_ok=True)
+        if source_moved and source_backup.exists():
+            source_path.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(source_backup, source_path)
+        for backup_path, old_path in reversed(backups):
+            old_path.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(backup_path, old_path)
+        raise
+
+
+def promotion_adjustment_merge_rows(paths: list[Path], max_rows: int, max_cols: int) -> tuple[list[str], list[list[str]], str]:
+    del max_rows  # Preview-only guard; formal cumulative merging reads every row.
+    header: list[str] = []
+    data_rows: list[list[str]] = []
+    for path in paths:
+        row_iterator = iter(iter_rows_full(path, max_cols))
+        try:
+            file_header = next(row_iterator)
+        except StopIteration:
+            continue
+        if len(file_header) > len(header):
+            header = file_header
+        data_rows.extend(
+            row for row in row_iterator if any(normalize_text(cell) for cell in row)
+        )
+
+    max_cols_seen = max([len(header), *(len(row) for row in data_rows)] or [0])
+    if not header:
+        header = ["操作时间", "操作人", "操作对象", "操作", "操作详情"]
+    if len(header) < max_cols_seen:
+        header = header + [f"列{index}" for index in range(len(header) + 1, max_cols_seen + 1)]
+
+    time_index = find_header_index(header, ["操作时间"])
+    latest_time: dt.datetime | None = None
+    unique_rows: list[list[str]] = []
+    seen: set[tuple[str, ...]] = set()
+    for row in data_rows:
+        normalized_row = [normalize_text(cell) for cell in row[:max_cols_seen]]
+        if len(normalized_row) < max_cols_seen:
+            normalized_row.extend([""] * (max_cols_seen - len(normalized_row)))
+        key = tuple(normalized_row)
+        if key in seen:
+            continue
+        seen.add(key)
+        if time_index is not None and time_index < len(normalized_row):
+            parsed_time = parse_datetime_text(normalized_row[time_index])
+            if parsed_time and (latest_time is None or parsed_time > latest_time):
+                latest_time = parsed_time
+        unique_rows.append(normalized_row)
+
+    if time_index is not None:
+        unique_rows.sort(
+            key=lambda row: (parse_datetime_text(row[time_index]) if time_index < len(row) else None) or dt.datetime.min,
+            reverse=True,
+        )
+    latest_date = latest_time.date().isoformat() if latest_time else ""
+    return header, unique_rows, latest_date
+
+
+def merge_after_sale_rows(paths: list[Path], max_rows: int, max_cols: int) -> tuple[list[str], list[list[str]], str]:
+    del max_rows  # Preview-only guard; formal cumulative merging reads every row.
+    headers: list[str] = []
+    rows_by_key: dict[tuple[str, str], list[str]] = {}
+    fallback_index = 0
+    latest_time: dt.datetime | None = None
+
+    for path in paths:
+        row_iterator = iter(iter_rows_full(path, max_cols))
+        try:
+            file_headers = next(row_iterator)
+        except StopIteration:
+            continue
+        append_headers(headers, file_headers)
+        key_index = find_header_index(file_headers, ["售后编号", "退款编号"])
+        time_index = find_header_index(file_headers, ["申请时间", "退款申请时间"])
+        for row in row_iterator:
+            if not any(normalize_text(cell) for cell in row):
+                continue
+            record = {normalize_text(header): normalize_text(row[index]) if index < len(row) else "" for index, header in enumerate(file_headers)}
+            append_headers(headers, record.keys())
+            if key_index is not None and key_index < len(row):
+                key_value = normalize_text(row[key_index])
+                key = ("售后或退款编号", key_value) if key_value else ("row", "|".join(normalize_text(cell) for cell in row))
+            else:
+                key = ("row", "|".join(normalize_text(cell) for cell in row))
+            if not key[1]:
+                fallback_index += 1
+                key = ("empty", f"{fallback_index}")
+            output_row = [record.get(header, "") for header in headers]
+            rows_by_key[key] = output_row
+            if time_index is not None and time_index < len(row):
+                parsed_time = parse_datetime_text(row[time_index])
+                if parsed_time and (latest_time is None or parsed_time > latest_time):
+                    latest_time = parsed_time
+
+    normalized_rows: list[list[str]] = []
+    for row in rows_by_key.values():
+        if len(row) < len(headers):
+            row = row + [""] * (len(headers) - len(row))
+        normalized_rows.append(row[: len(headers)])
+
+    sort_index = find_header_index(headers, ["申请时间", "退款申请时间"])
+    if sort_index is not None:
+        normalized_rows.sort(
+            key=lambda row: (parse_datetime_text(row[sort_index]) if sort_index < len(row) else None) or dt.datetime.min,
+            reverse=True,
+        )
+    latest_date = latest_time.date().isoformat() if latest_time else ""
+    return headers, normalized_rows, latest_date
+
+
+def write_xlsx_table(
+    path: Path,
+    headers: list[str],
+    rows: list[list[str]],
+    sheet_name: str = "推广调整日志",
+) -> None:
+    try:
+        from openpyxl import Workbook
+    except ImportError as exc:  # pragma: no cover - environment specific
+        raise RuntimeError("openpyxl is required to write merged promotion adjustment logs") from exc
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.title = sheet_name
+    worksheet.append(headers)
+    for row in rows:
+        worksheet.append(row)
+    worksheet.freeze_panes = "A2"
+    for column_cells in worksheet.columns:
+        max_length = max(len(normalize_text(cell.value)) for cell in column_cells)
+        worksheet.column_dimensions[column_cells[0].column_letter].width = min(max(max_length + 2, 12), 60)
+
+    temp_path = path.with_name(f"{path.stem}.tmp{path.suffix}")
+    workbook.save(temp_path)
+    workbook.close()
+    os.replace(temp_path, path)
+
+
+def normalize_promotion_spend(value: object, context: str) -> str:
+    text = normalize_text(value)
+    if text in {"", "-", "--"}:
+        return "0"
+    cleaned = (
+        text.replace(",", "")
+        .replace("￥", "")
+        .replace("¥", "")
+        .replace("元", "")
+        .strip()
+    )
+    try:
+        amount = Decimal(cleaned)
+    except InvalidOperation as exc:
+        raise RuntimeError(f"推广花费无效：{context}，值={text}") from exc
+    if not amount.is_finite():
+        raise RuntimeError(f"推广花费无效：{context}，值={text}")
+    if amount == 0:
+        return "0"
+    return format(amount.normalize(), "f")
+
+
+def promotion_record_key(
+    record: dict[str, str], context: str = ""
+) -> tuple[str, str, str, str]:
+    archive_date = normalize_text(record.get(PROMOTION_ARCHIVE_DATE_HEADER, ""))
+    product_id = normalize_product_id(
+        record.get(PROMOTION_ARCHIVE_PRODUCT_ID_HEADER, "")
+    )
+    promotion_type = normalize_text(record.get(PROMOTION_ARCHIVE_TYPE_HEADER, ""))
+    if not archive_date or not product_id or not promotion_type:
+        raise RuntimeError(
+            f"推广累计去重键缺失：{context}，"
+            f"日期={archive_date or '空'}，商品ID={product_id or '空'}，"
+            f"推广类型={promotion_type or '空'}"
+        )
+    spend_headers = PROMOTION_SPEND_HEADERS_BY_TYPE.get(promotion_type)
+    if not spend_headers:
+        raise RuntimeError(f"推广类型没有配置花费字段：{context}，推广类型={promotion_type}")
+    spend_header = next(
+        (
+            header
+            for header in spend_headers
+            if header in record and normalize_text(record.get(header, ""))
+        ),
+        next((header for header in spend_headers if header in record), ""),
+    )
+    if not spend_header:
+        raise RuntimeError(
+            f"推广数据缺少花费字段：{context}，推广类型={promotion_type}，"
+            f"要求字段={'/'.join(spend_headers)}"
+        )
+    spend = normalize_promotion_spend(
+        record.get(spend_header, ""),
+        f"{context}，字段={spend_header}",
+    )
+    return archive_date, product_id, promotion_type, spend
+
+
+def promotion_record_completeness(record: dict[str, str]) -> int:
+    return sum(1 for value in record.values() if normalize_text(value))
+
+
+def promotion_records(
+    paths: list[Path],
+    max_cols: int,
+    preferred_paths: set[Path] | None = None,
+    fallback_product_ids: dict[Path, str] | None = None,
+) -> tuple[list[str], list[dict[str, str]], int]:
+    headers = [
+        PROMOTION_ARCHIVE_DATE_HEADER,
+        PROMOTION_ARCHIVE_PRODUCT_ID_HEADER,
+        PROMOTION_ARCHIVE_TYPE_HEADER,
+    ]
+    records_by_key: dict[tuple[str, str, str, str], dict[str, str]] = {}
+    source_by_key: dict[tuple[str, str, str, str], Path] = {}
+    preferred_keys = {
+        os.path.normcase(str(path.resolve(strict=False)))
+        for path in (preferred_paths or set())
+    }
+    fallback_by_path = {
+        os.path.normcase(str(path.resolve(strict=False))): normalize_product_id(product_id)
+        for path, product_id in (fallback_product_ids or {}).items()
+        if normalize_product_id(product_id)
+    }
+    duplicate_rows = 0
+
+    for path in paths:
+        path_key = os.path.normcase(str(path.resolve(strict=False)))
+        path_is_preferred = path_key in preferred_keys
+        fallback_product_id = fallback_by_path.get(path_key, "")
+        scan_promotion_file_full(
+            path, max_cols, fallback_product_id=fallback_product_id
+        )
+        for promotion_row in iter_promotion_rows_full(path, max_cols):
+            row = promotion_row.values
+            if is_ignorable_promotion_row(promotion_row.headers, row):
+                continue
+            date_index, product_id_index = promotion_effective_column_indices(
+                promotion_row.headers, promotion_row.signature
+            )
+            parsed_date = (
+                parse_date(row[date_index])
+                if date_index is not None and date_index < len(row)
+                else None
+            )
+            product_id = promotion_product_id_for_row(
+                promotion_row.headers,
+                row,
+                promotion_row.signature,
+                fallback_product_id,
+            )
+            if parsed_date is None or not product_id:
+                raise RuntimeError(
+                    f"推广数据缺少具体日期或商品ID：文件={path}，工作表={promotion_row.sheet_name}，"
+                    f"行={promotion_row.row_number}；停止整理并保留源文件。"
+                )
+            record = row_to_dict(promotion_row.headers, row)
+            record[PROMOTION_ARCHIVE_DATE_HEADER] = parsed_date.isoformat()
+            record[PROMOTION_ARCHIVE_PRODUCT_ID_HEADER] = product_id
+            record[PROMOTION_ARCHIVE_TYPE_HEADER] = promotion_type_for_row(
+                promotion_row.headers, row, promotion_row.signature
+            )
+            append_headers(headers, promotion_row.headers)
+            record_key = promotion_record_key(
+                record,
+                f"文件={path}，工作表={promotion_row.sheet_name}，行={promotion_row.row_number}",
+            )
+            existing = records_by_key.get(record_key)
+            if existing is None:
+                records_by_key[record_key] = record
+                source_by_key[record_key] = path
+                continue
+            duplicate_rows += 1
+            existing_source_key = os.path.normcase(
+                str(source_by_key[record_key].resolve(strict=False))
+            )
+            existing_is_preferred = existing_source_key in preferred_keys
+            should_replace = (
+                (path_is_preferred and not existing_is_preferred)
+                or (
+                    path_is_preferred == existing_is_preferred
+                    and promotion_record_completeness(record)
+                    > promotion_record_completeness(existing)
+                )
+            )
+            if should_replace:
+                records_by_key[record_key] = record
+                source_by_key[record_key] = path
+
+    records = list(records_by_key.values())
+    records.sort(
+        key=lambda record: (
+            record.get(PROMOTION_ARCHIVE_DATE_HEADER, ""),
+            record.get(PROMOTION_ARCHIVE_PRODUCT_ID_HEADER, ""),
+            record.get(PROMOTION_ARCHIVE_TYPE_HEADER, ""),
+            tuple(sorted((key, normalize_text(value)) for key, value in record.items())),
+        ),
+        reverse=True,
+    )
+    return headers, records, duplicate_rows
+
+
+def merge_promotion_data(analysis: Analysis, max_cols: int) -> tuple[Path, int, int, int]:
+    final_path = analysis.target_path
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+    existing_paths = promotion_data_existing_paths(final_path)
+    merge_paths = [*existing_paths, analysis.source]
+    headers, records, duplicate_rows = promotion_records(
+        merge_paths,
+        max_cols,
+        preferred_paths={analysis.source},
+        fallback_product_ids={
+            analysis.source: promotion_analysis_fallback_product_id(analysis)
+        },
+    )
+    rows = [[normalize_text(record.get(header, "")) for header in headers] for record in records]
+
+    with tempfile.TemporaryDirectory(prefix=".promotion-merge-", dir=final_path.parent) as temp_name:
+        transaction_root = Path(temp_name)
+        staged_path = transaction_root / final_path.name
+        write_xlsx_table(staged_path, headers, rows, sheet_name=PROMOTION_REPORT_TYPE)
+        old_output_backup = transaction_root / "old-output.xlsx"
+        source_backup = transaction_root / "source" / analysis.source.name
+        old_output_moved = False
+        source_moved = False
+        installed = False
+        try:
+            if final_path.exists():
+                os.replace(final_path, old_output_backup)
+                old_output_moved = True
+            source_backup.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(analysis.source, source_backup)
+            source_moved = True
+            os.replace(staged_path, final_path)
+            installed = True
+        except Exception:
+            if installed and final_path.exists():
+                final_path.unlink()
+            if source_moved and source_backup.exists():
+                analysis.source.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(source_backup, analysis.source)
+            if old_output_moved and old_output_backup.exists():
+                final_path.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(old_output_backup, final_path)
+            raise
+
+    return final_path, len(merge_paths), len(rows), duplicate_rows
+
+
+def merge_promotion_adjustment_log(analysis: Analysis, max_rows: int, max_cols: int) -> tuple[Path, int, int]:
+    target_dir = analysis.target_path.parent
+    product_id_part = product_ids_filename_part(analysis.product_ids)
+    existing_paths = promotion_adjustment_existing_paths(target_dir, analysis.shop_name, product_id_part)
+    merge_paths = [*existing_paths, analysis.source]
+    headers, rows, latest_date = promotion_adjustment_merge_rows(merge_paths, max_rows, max_cols)
+    if not latest_date:
+        latest_date = promotion_adjustment_update_date(analysis.period, dt.date.fromisoformat(analysis.download_date))
+    final_name = promotion_adjustment_filename(analysis.shop_name, product_id_part, latest_date)
+    final_path = target_dir / f"{final_name}.xlsx"
+    write_xlsx_table(final_path, headers, rows)
+    for path in merge_paths:
+        if path.resolve() == final_path.resolve():
+            continue
+        if path.exists():
+            path.unlink()
+    analysis.target_path = final_path
+    return final_path, len(merge_paths), len(rows)
+
+
+def merge_after_sale_data(analysis: Analysis, max_rows: int, max_cols: int) -> tuple[Path, int, int]:
+    target_dir = analysis.target_path.parent
+    existing_paths = after_sale_existing_paths(target_dir)
+    merge_paths = [*existing_paths, analysis.source]
+    headers, rows, latest_date = merge_after_sale_rows(merge_paths, max_rows, max_cols)
+    if not latest_date:
+        latest_date = after_sale_update_date(analysis.period, dt.date.fromisoformat(analysis.download_date))
+    final_path = target_dir / f"{after_sale_filename(analysis.shop_name, latest_date)}.xlsx"
+    write_xlsx_table(final_path, headers, rows)
+    for path in merge_paths:
+        if path.resolve() == final_path.resolve():
+            continue
+        if path.exists():
+            path.unlink()
+    analysis.target_path = final_path
+    return final_path, len(merge_paths), len(rows)
+
+
+def order_month_keys_from_rows(rows: list[list[str]]) -> set[str]:
+    if not rows:
+        return set()
+    headers = rows[0]
+    time_index = find_header_index(headers, ORDER_TIME_HEADERS)
+    if time_index is None:
+        return set()
+    month_keys: set[str] = set()
+    for row in rows[1:]:
+        if time_index < len(row):
+            month_key = order_month_key_from_date(row[time_index])
+            if month_key:
+                month_keys.add(month_key)
+    return month_keys
+
+
+def merge_order_rows_by_month(
+    paths: list[Path],
+    shop_name: str,
+    max_rows: int,
+    max_cols: int,
+) -> dict[str, tuple[list[str], list[list[str]]]]:
+    del max_rows  # Preview-only guard; formal cumulative merging reads every row.
+    month_headers: dict[str, list[str]] = {}
+    records_by_order_id: dict[str, tuple[str, dict[str, str]]] = {}
+
+    for path in sorted(paths, key=lambda item: (order_source_datetime(item), item.name)):
+        scan_order_file_full(path, max_cols)
+        source_time = order_source_datetime(path).strftime("%Y-%m-%d %H:%M:%S")
+        for order_row in iter_order_rows_full(path, max_cols):
+            row_number = order_row.row_number
+            row = order_row.values
+            headers = order_row.headers
+            if not any(normalize_text(cell) for cell in row):
+                continue
+            if is_ignorable_order_row(row):
+                continue
+            order_id, _selected_id_header, raw_id_values = resolve_order_id_from_columns(
+                row, order_row.id_columns
+            )
+            if not order_id:
+                raise RuntimeError(
+                    f"订单编号为空：文件={path}，工作表={order_row.sheet_name}，行={row_number}，"
+                    f"编号字段={raw_id_values}；停止整理并保留源文件。"
+                )
+            parsed_time, _selected_time_header, raw_time_values = (
+                resolve_order_row_datetime_from_columns(row, order_row.time_columns)
+            )
+            if parsed_time is None:
+                if is_explicit_unpaid_or_cancelled_order(headers, row):
+                    continue
+                raise RuntimeError(
+                    f"订单时间无法识别：文件={path}，工作表={order_row.sheet_name}，行={row_number}，"
+                    f"订单号={order_id}，时间字段={raw_time_values}；"
+                    "停止整理并保留源文件。"
+                )
+            month_key = parsed_time.strftime("%Y-%m")
+            final_headers = month_headers.setdefault(month_key, [])
+            append_headers(final_headers, [header for header in headers if header not in ORDER_SUMMARY_METADATA_HEADERS])
+            append_headers(final_headers, ORDER_SALES_MARK_HEADERS)
+            append_headers(final_headers, ORDER_SUMMARY_METADATA_HEADERS)
+            record = row_to_dict(headers, row)
+            apply_order_sales_marks(record)
+            record["汇总_店铺名称"] = shop_name
+            record["汇总_最新下载时间"] = source_time
+            record["汇总_最新来源文件"] = path.name
+            record["汇总_最新归档文件"] = ""
+            if order_id in records_by_order_id:
+                old_month_key, old_record = records_by_order_id[order_id]
+                merged_headers: list[str] = []
+                append_headers(merged_headers, month_headers.get(old_month_key, []))
+                append_headers(merged_headers, final_headers)
+                append_headers(final_headers, merged_headers)
+                records_by_order_id[order_id] = (
+                    month_key,
+                    merge_order_summary_record(old_record, record, merged_headers),
+                )
+            else:
+                records_by_order_id[order_id] = (
+                    month_key,
+                    {
+                        header: normalize_text(record.get(header, ""))
+                        for header in final_headers
+                    },
+                )
+
+    month_records: dict[str, dict[str, dict[str, str]]] = {}
+    for order_id, (month_key, record) in records_by_order_id.items():
+        month_records.setdefault(month_key, {})[order_id] = record
+
+    result: dict[str, tuple[list[str], list[list[str]]]] = {}
+    for month_key, records in month_records.items():
+        headers = month_headers[month_key]
+        time_index = find_header_index(headers, ORDER_TIME_HEADERS)
+        rows = []
+        for record in records.values():
+            rows.append([normalize_text(record.get(header, "")) for header in headers])
+        if time_index is not None:
+            rows.sort(
+                key=lambda row: (parse_datetime_text(row[time_index]) if time_index < len(row) else None) or dt.datetime.min,
+                reverse=True,
+            )
+        result[month_key] = (headers, rows)
+    return result
+
+
+def merge_order_data(
+    analysis: Analysis,
+    database_root: Path,
+    max_rows: int,
+    max_cols: int,
+) -> list[tuple[Path, int, int]]:
+    del max_rows  # The row cap is preview-only; formal order merging always reads every row.
+    merge_paths, source_scan = order_merge_paths_full(analysis, database_root, max_cols)
+    old_paths = [path for path in merge_paths if path.resolve() != analysis.source.resolve()]
+    with tempfile.TemporaryDirectory(prefix=".order-merge-", dir=database_root) as temp_name:
+        transaction_root = Path(temp_name)
+        connection = create_order_merge_database(transaction_root / "orders.sqlite3")
+        try:
+            (
+                month_headers,
+                total_read,
+                total_valid,
+                total_ignored,
+                duplicate_rows,
+            ) = load_order_merge_database(
+                connection,
+                merge_paths,
+                analysis.source,
+                analysis.shop_name,
+                max_cols,
+            )
+            staged_outputs = stage_order_outputs(
+                connection,
+                month_headers,
+                analysis.shop_name,
+                database_root,
+                transaction_root / "new",
+            )
+            written_rows = sum(row_count for _staged, _final, row_count in staged_outputs)
+            unique_rows = int(
+                connection.execute("SELECT COUNT(*) FROM order_records").fetchone()[0]
+            )
+            if written_rows != unique_rows:
+                raise RuntimeError(
+                    f"订单合并最终核对失败：唯一订单={unique_rows}，写入={written_rows}；"
+                    "停止整理并保留源文件。"
+                )
+            commit_order_outputs(
+                staged_outputs,
+                old_paths,
+                analysis.source,
+                transaction_root / "old",
+            )
+        finally:
+            connection.close()
+
+    outputs = [
+        (final_path, len(merge_paths), row_count)
+        for _staged_path, final_path, row_count in staged_outputs
+    ]
+    if outputs:
+        analysis.target_path = outputs[-1][0]
+    print(
+        "order row integrity verified:",
+        f"source_rows={source_scan.read_rows}",
+        f"all_read={total_read}",
+        f"valid={total_valid}",
+        f"ignored={total_ignored}",
+        f"duplicates={duplicate_rows}",
+        f"written={sum(row_count for _path, _sources, row_count in outputs)}",
+    )
+    return outputs
+
+
+def unique_path(path: Path) -> Path:
+    if not path.exists():
+        return path
+    stem = path.stem
+    suffix = path.suffix
+    parent = path.parent
+    index = 2
+    while True:
+        candidate = parent / f"{stem}_{index:02d}{suffix}"
+        if not candidate.exists():
+            return candidate
+        index += 1
+
+
+def reserve_unique_targets(analyses: list[Analysis]) -> None:
+    reserved: set[str] = set()
+    for analysis in analyses:
+        if analysis.status != "ready":
+            continue
+        if analysis.report_type in {
+            ORDER_REPORT_TYPE,
+            AFTER_SALE_REPORT_TYPE,
+            PROMOTION_REPORT_TYPE,
+            PROMOTION_ADJUSTMENT_REPORT_TYPE,
+        }:
+            continue
+        original = analysis.target_path
+        candidate = original
+        index = 2
+        while str(candidate).lower() in reserved or candidate.exists():
+            candidate = original.parent / f"{original.stem}_{index:02d}{original.suffix}"
+            index += 1
+        analysis.target_path = candidate
+        reserved.add(str(candidate).lower())
+
+
+def target_for_pending(database_root: Path, source: Path, file_download_date: dt.date) -> Path:
+    return source
+
+
+def target_for_success(
+    database_root: Path,
+    source: Path,
+    signature: Signature,
+    shop_name: str,
+    period: str,
+    file_download_date: dt.date,
+    product_ids: list[str] | None = None,
+) -> Path:
+    if signature.report_type == PROMOTION_REPORT_TYPE:
+        target_dir = promotion_data_folder(database_root, shop_name)
+        return target_dir / promotion_data_filename(shop_name)
+
+    target_dir = (
+        report_root(database_root, signature.report_type)
+        / sanitize_filename_part(shop_name)
+        / f"{file_download_date.year}年"
+        / f"{file_download_date.month}月（导出时间）"
+    )
+    if signature.report_type == PROMOTION_ADJUSTMENT_REPORT_TYPE:
+        update_date = promotion_adjustment_update_date(period, file_download_date)
+        filename = promotion_adjustment_filename(shop_name, product_ids_filename_part(product_ids or []), update_date)
+        return target_dir / f"{filename}.xlsx"
+    if signature.report_type == ORDER_REPORT_TYPE:
+        date_range = period_date_range(period)
+        month_key = (date_range[1] if date_range else file_download_date.isoformat())[:7]
+        target_dir = order_data_folder(database_root, shop_name, month_key)
+        return target_dir / f"{order_data_filename(shop_name, month_key)}.xlsx"
+    if signature.report_type == AFTER_SALE_REPORT_TYPE:
+        update_date = after_sale_update_date(period, file_download_date)
+        filename = after_sale_filename(shop_name, update_date)
+        return target_dir / f"{filename}.xlsx"
+    else:
+        filename = "-".join(
+            [
+                file_download_date.isoformat(),
+                sanitize_filename_part(shop_name),
+                sanitize_filename_part(signature.report_type),
+                sanitize_filename_part(period),
+            ]
+        )
+    return unique_path(target_dir / f"{filename}{source.suffix.lower()}")
+
+
+def analyze_file(
+    source: Path,
+    database_root: Path,
+    signatures: list[Signature],
+    product_map: dict[str, str],
+    shops: list[str],
+    max_rows: int,
+    max_cols: int,
+) -> Analysis:
+    file_download_date = download_date(source)
+    try:
+        rows = read_rows(source, max_rows, max_cols)
+    except Exception as exc:
+        target = target_for_pending(database_root, source, file_download_date)
+        return Analysis(
+            source=source,
+            status="pending",
+            reason=f"read_error: {exc}",
+            report_type="",
+            target_folder="_待确认",
+            shop_name="",
+            shop_source="",
+            period="",
+            period_source="",
+            download_date=file_download_date.isoformat(),
+            target_path=target,
+            product_counts="",
+            matched_headers="",
+            missing_fields="read_error",
+            map_updates=[],
+            product_ids=[],
+            new_product_ids=[],
+        )
+
+    signature, header_row_index, headers, matched = match_signature(rows, signatures)
+    if signature is None:
+        target = target_for_pending(database_root, source, file_download_date)
+        return Analysis(
+            source=source,
+            status="pending",
+            reason="unknown_report_signature",
+            report_type="",
+            target_folder="_待确认",
+            shop_name="",
+            shop_source="",
+            period="",
+            period_source="",
+            download_date=file_download_date.isoformat(),
+            target_path=target,
+            product_counts="",
+            matched_headers="",
+            missing_fields="report_type",
+            map_updates=[],
+            product_ids=[],
+            new_product_ids=[],
+        )
+
+    daily_breakdown_metadata = (
+        pdd_daily_breakdown_filename_metadata(source)
+        if is_pdd_daily_breakdown_signature(signature)
+        else None
+    )
+    filename_product_id = (
+        daily_breakdown_metadata.filename_product_id
+        if daily_breakdown_metadata is not None
+        else ""
+    )
+    product_ids = collect_product_ids(rows, header_row_index, headers, signature)
+    if not product_ids and filename_product_id:
+        product_ids = [filename_product_id]
+    sales_product_ids = collect_product_ids(
+        rows,
+        header_row_index,
+        headers,
+        signature,
+        exclude_supplementary_price_order_lines=(
+            signature.report_type == ORDER_REPORT_TYPE
+        ),
+    )
+    supplementary_price_rows, supplementary_price_examples = (
+        preview_supplementary_price_order_rows(
+            rows, header_row_index, headers, signature
+        )
+    )
+    new_product_ids = []
+    if signature.report_type in PRODUCT_ID_CHECK_REPORT_TYPES:
+        product_ids_for_reminder = (
+            sales_product_ids
+            if signature.report_type == ORDER_REPORT_TYPE
+            else product_ids
+        )
+        new_product_ids = sorted(
+            {
+                product_id
+                for product_id in product_ids_for_reminder
+                if product_id not in product_map
+            }
+        )
+    shop_name, shop_source, product_counts = decide_shop(
+        source, signature.report_type, rows, product_ids, product_map, shops
+    )
+    if daily_breakdown_metadata is not None and not shop_name:
+        filename_shop = canonicalize_shop(daily_breakdown_metadata.shop_text, shops)
+        if filename_shop:
+            shop_name = filename_shop
+            shop_source = "daily_breakdown_filename"
+    platform, platform_source = detect_platform(source, rows, signature)
+    shop_name = normalize_shop_platform(shop_name, platform)
+    if shop_name and platform_source:
+        shop_source = "+".join(part for part in (shop_source, f"platform:{platform_source}") if part)
+    period, period_source = decide_period(source, signature, rows, header_row_index, headers, file_download_date)
+
+    missing: list[str] = []
+    promotion_missing_fields: list[str] = []
+    if signature.report_type == PROMOTION_REPORT_TYPE:
+        promotion_missing_fields = promotion_preview_missing_fields(
+            rows,
+            header_row_index,
+            headers,
+            signature,
+            fallback_product_id=filename_product_id,
+        )
+    if not shop_name:
+        missing.append("shop_name")
+    if not period and "具体日期" not in promotion_missing_fields:
+        missing.append("period")
+    missing.extend(promotion_missing_fields)
+    if not promotion_missing_fields and is_multi_day_promotion_summary(
+        source,
+        signature.report_type,
+        period,
+        rows,
+        header_row_index,
+        headers,
+        signature.period_headers,
+        signature.product_id_headers,
+        filename_product_id,
+    ):
+        missing.append("single_day_period")
+
+    map_updates: list[tuple[str, str]] = []
+    if signature.report_type == "商品数据" and shop_name:
+        for product_id in product_ids:
+            if product_id and product_map.get(product_id) != shop_name:
+                map_updates.append((product_id, shop_name))
+
+    if missing:
+        target = target_for_pending(database_root, source, file_download_date)
+        if signature.report_type == PROMOTION_REPORT_TYPE and promotion_missing_fields:
+            reason = "promotion_missing_date_or_product_id"
+        elif missing == ["single_day_period"]:
+            reason = "multi_day_promotion_summary"
+        else:
+            reason = "missing_required_fields"
+        return Analysis(
+            source=source,
+            status="pending",
+            reason=reason,
+            report_type=signature.report_type,
+            target_folder="_待确认",
+            shop_name=shop_name,
+            shop_source=shop_source,
+            period=period,
+            period_source=period_source,
+            download_date=file_download_date.isoformat(),
+            target_path=target,
+            product_counts=product_counts,
+            matched_headers="|".join(matched),
+            missing_fields="|".join(missing),
+            map_updates=map_updates,
+            product_ids=product_ids,
+            new_product_ids=new_product_ids,
+            supplementary_price_rows=supplementary_price_rows,
+            supplementary_price_examples=supplementary_price_examples,
+        )
+
+    target = target_for_success(database_root, source, signature, shop_name, period, file_download_date, product_ids)
+    return Analysis(
+        source=source,
+        status="ready",
+        reason="ok",
+        report_type=signature.report_type,
+        target_folder=REPORT_ROOT_BY_TYPE.get(signature.report_type, signature.target_folder),
+        shop_name=shop_name,
+        shop_source=shop_source,
+        period=period,
+        period_source=period_source,
+        download_date=file_download_date.isoformat(),
+        target_path=target,
+        product_counts=product_counts,
+        matched_headers="|".join(matched),
+        missing_fields="",
+        map_updates=map_updates,
+        product_ids=product_ids,
+        new_product_ids=new_product_ids,
+        supplementary_price_rows=supplementary_price_rows,
+        supplementary_price_examples=supplementary_price_examples,
+    )
+
+
+def iter_input_files(input_dir: Path) -> list[Path]:
+    return sorted(
+        [path for path in input_dir.iterdir() if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS],
+        key=lambda path: path.name.lower(),
+    )
+
+
+def file_crc32(path: Path) -> int:
+    checksum = 0
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            checksum = zlib.crc32(chunk, checksum)
+    return checksum & 0xFFFFFFFF
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def mark_exact_duplicate_inputs(analyses: list[Analysis], input_dir: Path) -> None:
+    """Keep one deterministically chosen source per identical-content group."""
+    groups: dict[tuple[int, str], list[Analysis]] = {}
+    for analysis in analyses:
+        if not analysis.source.is_file():
+            continue
+        key = (analysis.source.stat().st_size, file_sha256(analysis.source))
+        groups.setdefault(key, []).append(analysis)
+
+    duplicate_dir = input_dir / DUPLICATE_INPUT_FOLDER_NAME
+    for group in groups.values():
+        if len(group) < 2:
+            continue
+        group.sort(key=lambda item: (item.status != "ready", item.source.name.lower()))
+        retained = group[0]
+        for duplicate in group[1:]:
+            duplicate.status = "duplicate_file"
+            duplicate.reason = f"exact_duplicate_of:{retained.source.name}"
+            duplicate.target_folder = DUPLICATE_INPUT_FOLDER_NAME
+            duplicate.target_path = unique_path(duplicate_dir / duplicate.source.name)
+
+
+def zip_member_filename(info: zipfile.ZipInfo) -> str:
+    raw_name = info.filename.replace("\\", "/")
+    member_path = PurePosixPath(raw_name)
+    if (
+        member_path.is_absolute()
+        or ".." in member_path.parts
+        or re.match(r"^[A-Za-z]:", raw_name)
+    ):
+        raise RuntimeError(f"unsafe ZIP member path: {info.filename}")
+    filename = member_path.name
+    suffix = Path(filename).suffix.lower()
+    if suffix not in SUPPORTED_EXTENSIONS:
+        return ""
+    stem = sanitize_filename_part(Path(filename).stem) or "report"
+    return f"{stem}{suffix}"
+
+
+def unique_extraction_target(input_dir: Path, filename: str, reserved: set[Path]) -> Path:
+    candidate = input_dir / filename
+    if candidate not in reserved and not candidate.exists():
+        return candidate
+    stem = candidate.stem
+    suffix = candidate.suffix
+    index = 2
+    while True:
+        alternative = input_dir / f"{stem}_{index:02d}{suffix}"
+        if alternative not in reserved and not alternative.exists():
+            return alternative
+        index += 1
+
+
+def extract_zip_inputs(input_dir: Path) -> None:
+    zip_paths = sorted(
+        [
+            path
+            for path in input_dir.iterdir()
+            if path.is_file() and path.suffix.lower() in SUPPORTED_ARCHIVE_EXTENSIONS
+        ],
+        key=lambda path: path.name.lower(),
+    )
+    if not zip_paths:
+        return
+
+    extracted_zip_dir = input_dir / EXTRACTED_ZIP_FOLDER_NAME
+    for zip_path in zip_paths:
+        temp_paths: list[Path] = []
+        committed_paths: list[Path] = []
+        try:
+            with zipfile.ZipFile(zip_path) as archive:
+                members: list[tuple[zipfile.ZipInfo, str]] = []
+                for info in archive.infolist():
+                    if info.is_dir():
+                        continue
+                    filename = zip_member_filename(info)
+                    if filename:
+                        members.append((info, filename))
+
+                if not members:
+                    raise RuntimeError("no supported .csv, .xlsx, or .xls files found")
+
+                reserved: set[Path] = set()
+                planned: list[tuple[Path, Path]] = []
+                reused_count = 0
+                for info, filename in members:
+                    preferred = input_dir / filename
+                    if (
+                        preferred not in reserved
+                        and preferred.exists()
+                        and preferred.is_file()
+                        and preferred.stat().st_size == info.file_size
+                        and file_crc32(preferred) == info.CRC
+                    ):
+                        reserved.add(preferred)
+                        reused_count += 1
+                        continue
+
+                    target = unique_extraction_target(input_dir, filename, reserved)
+                    reserved.add(target)
+                    with tempfile.NamedTemporaryFile(
+                        prefix=".zip_extract_", suffix=".tmp", dir=input_dir, delete=False
+                    ) as temp_handle:
+                        temp_path = Path(temp_handle.name)
+                    temp_paths.append(temp_path)
+                    with archive.open(info) as source, temp_path.open("wb") as destination:
+                        shutil.copyfileobj(source, destination)
+                    planned.append((temp_path, target))
+
+                for temp_path, target in planned:
+                    os.replace(temp_path, target)
+                    committed_paths.append(target)
+                    temp_paths.remove(temp_path)
+
+            extracted_zip_dir.mkdir(parents=True, exist_ok=True)
+            archived_zip = unique_path(extracted_zip_dir / zip_path.name)
+            shutil.move(str(zip_path), str(archived_zip))
+            print(
+                "zip extracted:",
+                f"source={zip_path}",
+                f"new_files={len(committed_paths)}",
+                f"existing_files={reused_count}",
+                f"zip_archived={archived_zip}",
+            )
+        except (OSError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile) as exc:
+            for temp_path in temp_paths:
+                try:
+                    temp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            for committed_path in committed_paths:
+                try:
+                    committed_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            raise RuntimeError(f"ZIP preparation failed for {zip_path}: {exc}") from exc
+
+
+def input_file_prefix(path: Path) -> str:
+    match = re.match(r"([0-9a-f]{32})", path.name, flags=re.IGNORECASE)
+    return match.group(1).lower() if match else ""
+
+
+def apply_pdd_daily_breakdown_metadata_evidence(
+    analyses: list[Analysis],
+    product_map: dict[str, str],
+    shops: list[str],
+) -> None:
+    """Resolve the filename-only ID safely, preferring matching log content."""
+    log_ids_by_key: dict[tuple[str, str], set[str]] = {}
+    for analysis in analyses:
+        if analysis.report_type != PROMOTION_ADJUSTMENT_REPORT_TYPE:
+            continue
+        metadata = pdd_operation_log_filename_metadata(analysis.source)
+        if metadata is None:
+            continue
+        shop_name = analysis.shop_name or canonicalize_shop(metadata.shop_text, shops)
+        product_ids = {
+            normalize_product_id(product_id)
+            for product_id in analysis.product_ids
+            if normalize_product_id(product_id)
+        }
+        if not shop_name or not product_ids:
+            continue
+        log_ids_by_key.setdefault((shop_name, metadata.item_token), set()).update(
+            product_ids
+        )
+
+    for analysis in analyses:
+        if analysis.report_type != PROMOTION_REPORT_TYPE:
+            continue
+        metadata = pdd_daily_breakdown_filename_metadata(analysis.source)
+        if metadata is None:
+            continue
+        filename_shop = canonicalize_shop(metadata.shop_text, shops)
+        if not filename_shop:
+            analysis.status = "pending"
+            analysis.reason = "promotion_daily_breakdown_unknown_filename_shop"
+            analysis.target_folder = "_待确认"
+            analysis.target_path = analysis.source
+            analysis.missing_fields = "店铺"
+            continue
+        if analysis.shop_name and strip_platform_suffix(analysis.shop_name) != strip_platform_suffix(
+            filename_shop
+        ):
+            analysis.status = "pending"
+            analysis.reason = "promotion_daily_breakdown_shop_conflict"
+            analysis.target_folder = "_待确认"
+            analysis.target_path = analysis.source
+            analysis.missing_fields = "店铺证据冲突"
+            continue
+
+        log_ids = log_ids_by_key.get((filename_shop, metadata.item_token), set())
+        if len(log_ids) > 1:
+            analysis.status = "pending"
+            analysis.reason = "promotion_daily_breakdown_product_id_conflict"
+            analysis.target_folder = "_待确认"
+            analysis.target_path = analysis.source
+            analysis.missing_fields = "商品ID证据冲突"
+            continue
+
+        resolved_product_id = (
+            next(iter(log_ids)) if log_ids else metadata.filename_product_id
+        )
+        mapped_shop = product_map.get(resolved_product_id, "")
+        if mapped_shop and strip_platform_suffix(mapped_shop) != strip_platform_suffix(
+            filename_shop
+        ):
+            analysis.status = "pending"
+            analysis.reason = "promotion_daily_breakdown_product_shop_conflict"
+            analysis.target_folder = "_待确认"
+            analysis.target_path = analysis.source
+            analysis.missing_fields = "商品ID与店铺映射冲突"
+            continue
+
+        analysis.shop_name = filename_shop
+        evidence_source = "operation_log_content" if log_ids else "strict_filename"
+        analysis.shop_source = "+".join(
+            part
+            for part in (analysis.shop_source, f"daily_breakdown:{evidence_source}")
+            if part
+        )
+        analysis.product_ids = [resolved_product_id]
+        analysis.new_product_ids = (
+            [] if resolved_product_id in product_map else [resolved_product_id]
+        )
+        analysis.product_counts = (
+            f"filename_product_id={metadata.filename_product_id};"
+            f"resolved_product_id={resolved_product_id};"
+            f"id_source={evidence_source}"
+        )
+
+
+def apply_batch_shop_inference(
+    database_root: Path,
+    analyses: list[Analysis],
+    signatures: list[Signature],
+    file_download_dates: dict[Path, dt.date],
+) -> None:
+    signatures_by_type = {signature.report_type: signature for signature in signatures}
+    prefix_shops: dict[str, str] = {}
+    for analysis in analyses:
+        prefix = input_file_prefix(analysis.source)
+        if prefix and analysis.shop_name:
+            prefix_shops.setdefault(prefix, analysis.shop_name)
+
+    # Keep every product ID observed in an identified single-shop report. Some
+    # promotion adjustment logs expose their product ID only in free-text
+    # fields, so batch inference must not depend on new-product reminders.
+    # Retain conflicts as sets and never use an ambiguous ID automatically.
+    batch_product_shops: dict[str, set[str]] = {}
+    for analysis in analyses:
+        if not analysis.shop_name:
+            continue
+        for product_id in analysis.product_ids:
+            if product_id:
+                batch_product_shops.setdefault(product_id, set()).add(analysis.shop_name)
+
+    for analysis in analyses:
+        if analysis.shop_name or not analysis.report_type or not analysis.period:
+            continue
+        prefix = input_file_prefix(analysis.source)
+        shop_name = prefix_shops.get(prefix, "")
+        if not shop_name and analysis.product_ids:
+            counts = Counter(
+                next(iter(candidate_shops))
+                for product_id in dict.fromkeys(analysis.product_ids)
+                for candidate_shops in [batch_product_shops.get(product_id, set())]
+                if len(candidate_shops) == 1
+            )
+            if counts:
+                top_shop, top_count = counts.most_common(1)[0]
+                second_count = counts.most_common(2)[1][1] if len(counts) > 1 else 0
+                if top_count > second_count:
+                    shop_name = top_shop
+        signature = signatures_by_type.get(analysis.report_type)
+        if not shop_name or signature is None:
+            continue
+        analysis.shop_name = shop_name
+        analysis.shop_source = "batch_prefix" if prefix and prefix in prefix_shops else "batch_product_id"
+        analysis.missing_fields = ";".join(
+            field for field in analysis.missing_fields.split(";") if field and field != "shop_name"
+        )
+        if not analysis.missing_fields:
+            analysis.status = "ready"
+            analysis.reason = "ok"
+            analysis.target_folder = REPORT_ROOT_BY_TYPE.get(
+                signature.report_type, signature.target_folder
+            )
+            analysis.target_path = target_for_success(
+                database_root,
+                analysis.source,
+                signature,
+                shop_name,
+                analysis.period,
+                file_download_dates.get(analysis.source, download_date(analysis.source)),
+                analysis.product_ids,
+            )
+
+
+def manifest_row(analysis: Analysis, action: str) -> dict[str, str]:
+    return {
+        "action": action,
+        "status": analysis.status,
+        "reason": analysis.reason,
+        "source_path": str(analysis.source),
+        "source_name": analysis.source.name,
+        "target_path": str(analysis.target_path),
+        "target_name": analysis.target_path.name,
+        "report_type": analysis.report_type,
+        "target_folder": analysis.target_folder,
+        "shop_name": analysis.shop_name,
+        "shop_source": analysis.shop_source,
+        "period": analysis.period,
+        "period_source": analysis.period_source,
+        "download_date": analysis.download_date,
+        "product_counts": analysis.product_counts,
+        "matched_headers": analysis.matched_headers,
+        "missing_fields": analysis.missing_fields,
+        "map_updates": ";".join(f"{product_id}:{shop}" for product_id, shop in analysis.map_updates),
+        "new_product_ids": "|".join(analysis.new_product_ids),
+        "supplementary_price_rows": str(analysis.supplementary_price_rows),
+        "supplementary_price_message": (
+            "已识别为补差价，不计销售；不触发新商品ID提醒或商品映射。"
+            if analysis.supplementary_price_rows
+            else ""
+        ),
+        "supplementary_price_examples": analysis.supplementary_price_examples,
+    }
+
+
+def missing_reminder_path(database_root: Path, apply: bool) -> Path:
+    return database_root / OPERATIONS_LOG_DIR / ("缺失提醒.csv" if apply else "缺失提醒_预览.csv")
+
+
+def unrecorded_product_mapping_path(database_root: Path, apply: bool) -> Path:
+    name = "未收录商品ID对照表.xlsx" if apply else "未收录商品ID对照表_预览.xlsx"
+    return database_root / PRODUCT_ID_DATABASE_DIR / name
+
+
+def unrecorded_product_targets(
+    reminder_rows: list[dict[str, str]],
+) -> dict[tuple[str, str], tuple[str, str]]:
+    targets: dict[tuple[str, str], tuple[str, str]] = {}
+    for reminder in reminder_rows:
+        if reminder.get("status") not in {"new_product_id", "historical_product_id"}:
+            continue
+        shop_name = normalize_text(reminder.get("shop_name", ""))
+        label = "需补导商品数据" if reminder["status"] == "new_product_id" else "售后核对（无需补导）"
+        for product_id in reminder.get("new_product_ids", "").split("|"):
+            product_id = normalize_product_id(product_id)
+            if shop_name and product_id:
+                targets[(shop_name, product_id)] = (label, reminder["status"])
+    return targets
+
+
+def exact_header_index(headers: list[str], candidates: Iterable[str]) -> int | None:
+    normalized = {normalize_header(candidate) for candidate in candidates}
+    return next(
+        (
+            index
+            for index, header in enumerate(headers)
+            if normalize_header(header) in normalized
+        ),
+        None,
+    )
+
+
+def product_data_rows(
+    path: Path,
+    max_rows: int,
+    max_cols: int,
+) -> Iterable[tuple[list[str], list[str]]]:
+    rows = read_rows(path, max_rows, max_cols)
+    header_index: int | None = None
+    headers: list[str] = []
+    for index, row in enumerate(rows):
+        product_index = exact_header_index(
+            row,
+            ("商品ID（必填）", "商品ID", "商品id", "商品Id"),
+        )
+        title_index = exact_header_index(
+            row,
+            ("商品名称", "商品标题", "宝贝标题"),
+        )
+        if product_index is not None and title_index is not None:
+            header_index = index
+            headers = row
+            break
+    if header_index is None:
+        return
+    for row in rows[header_index + 1 :]:
+        if any(normalize_text(cell) for cell in row):
+            yield headers, row
+
+
+def collect_unrecorded_product_records(
+    database_root: Path,
+    analyses: list[Analysis],
+    reminder_rows: list[dict[str, str]],
+    max_rows: int = PREVIEW_MAX_ROWS,
+    max_cols: int = XLS_MAX_COLUMNS,
+) -> list[dict[str, str]]:
+    """Collect exact shop/product/style/SKU evidence for mapping and marketing maintenance."""
+    targets = unrecorded_product_targets(reminder_rows)
+    if not targets:
+        return []
+
+    found: dict[
+        tuple[str, str],
+        dict[tuple[str, str], dict[str, set[str]]],
+    ] = defaultdict(lambda: defaultdict(lambda: {"titles": set(), "sources": set()}))
+
+    def add_record(
+        shop_name: str,
+        product_id: str,
+        style_id: str,
+        sku: str,
+        title: str,
+        source_name: str,
+    ) -> None:
+        key = (normalize_text(shop_name), normalize_product_id(product_id))
+        if key not in targets:
+            return
+        detail_key = (normalize_text(style_id), normalize_text(sku))
+        if title:
+            found[key][detail_key]["titles"].add(normalize_text(title))
+        if source_name:
+            found[key][detail_key]["sources"].add(normalize_text(source_name))
+
+    order_root = database_root / ORDER_DATABASE_DIR
+    current_order_shops = {
+        analysis.source.resolve(): analysis.shop_name
+        for analysis in analyses
+        if analysis.report_type == ORDER_REPORT_TYPE and analysis.shop_name
+    }
+    order_paths = {
+        path
+        for path in order_root.rglob("*")
+        if order_root.exists()
+        and path.is_file()
+        and path.suffix.lower() in SUPPORTED_EXTENSIONS
+    }
+    order_paths.update(current_order_shops)
+    for path in sorted(order_paths, key=lambda item: str(item).casefold()):
+        try:
+            resolved = path.resolve()
+            source_shop = current_order_shops.get(resolved, "")
+            if not source_shop:
+                source_shop = path.relative_to(order_root).parts[0]
+            for order_row in iter_order_rows_full(path, max_cols):
+                headers = order_row.headers
+                values = order_row.values
+                record = row_to_dict(headers, values)
+                if classify_order_line(record).is_supplementary_price:
+                    continue
+                product_index = exact_header_index(headers, ("商品ID", "商品id", "商品Id"))
+                if product_index is None or product_index >= len(values):
+                    continue
+                product_id = normalize_product_id(values[product_index])
+                if (source_shop, product_id) not in targets:
+                    continue
+                style_index = exact_header_index(
+                    headers,
+                    ("样式ID", "样式id", "款式ID", "款式id", "SKUID", "skuId"),
+                )
+                code_index = exact_header_index(
+                    headers,
+                    ("商家编码-规格维度", "商家编码（规格维度）"),
+                )
+                title_index = exact_header_index(
+                    headers,
+                    ("商品", "商品名称", "商品标题", "宝贝标题"),
+                )
+                style_id = (
+                    normalize_text(values[style_index])
+                    if style_index is not None and style_index < len(values)
+                    else ""
+                )
+                merchant_code = (
+                    normalize_text(values[code_index])
+                    if code_index is not None and code_index < len(values)
+                    else ""
+                )
+                title = (
+                    normalize_text(values[title_index])
+                    if title_index is not None and title_index < len(values)
+                    else ""
+                )
+                add_record(
+                    source_shop,
+                    product_id,
+                    style_id,
+                    merchant_code,
+                    title,
+                    path.name,
+                )
+        except Exception:
+            continue
+
+    product_root = database_root / PRODUCT_DATABASE_DIR
+    current_product_shops = {
+        analysis.source.resolve(): analysis.shop_name
+        for analysis in analyses
+        if analysis.report_type == "商品数据" and analysis.shop_name
+    }
+    product_paths = {
+        path
+        for path in product_root.rglob("*")
+        if product_root.exists()
+        and path.is_file()
+        and path.suffix.lower() in SUPPORTED_EXTENSIONS
+    }
+    product_paths.update(current_product_shops)
+    for path in sorted(product_paths, key=lambda item: str(item).casefold()):
+        try:
+            resolved = path.resolve()
+            source_shop = current_product_shops.get(resolved, "")
+            if not source_shop:
+                source_shop = shop_from_product_archive_path(path, database_root)
+            if not source_shop:
+                continue
+            for headers, values in product_data_rows(path, max_rows, max_cols):
+                product_index = exact_header_index(
+                    headers,
+                    ("商品ID（必填）", "商品ID", "商品id", "商品Id"),
+                )
+                if product_index is None or product_index >= len(values):
+                    continue
+                product_id = normalize_product_id(values[product_index])
+                if (source_shop, product_id) not in targets:
+                    continue
+                style_index = exact_header_index(
+                    headers,
+                    (
+                        "SKUID（必填，注意不是SKU编码）",
+                        "SKUID",
+                        "skuId",
+                        "样式ID",
+                    ),
+                )
+                code_index = exact_header_index(headers, ("规格编码",))
+                title_index = exact_header_index(
+                    headers,
+                    ("商品名称", "商品标题", "宝贝标题"),
+                )
+                style_id = (
+                    normalize_text(values[style_index])
+                    if style_index is not None and style_index < len(values)
+                    else ""
+                )
+                merchant_code = (
+                    normalize_text(values[code_index])
+                    if code_index is not None and code_index < len(values)
+                    else ""
+                )
+                title = (
+                    normalize_text(values[title_index])
+                    if title_index is not None and title_index < len(values)
+                    else ""
+                )
+                add_record(
+                    source_shop,
+                    product_id,
+                    style_id,
+                    merchant_code,
+                    title,
+                    path.name,
+                )
+        except Exception:
+            continue
+
+    records: list[dict[str, str]] = []
+    for (shop_name, product_id), (label, reminder_status) in sorted(targets.items()):
+        details = found.get((shop_name, product_id), {})
+        if not details:
+            records.append(
+                {
+                    "reminder_label": label,
+                    "reminder_status": reminder_status,
+                    "shop_name": shop_name,
+                    "product_id": product_id,
+                    "style_id": "",
+                    "sku": "",
+                    "title": "",
+                    "source_name": "订单/商品数据中未找到对应明细",
+                }
+            )
+            continue
+        nonblank_skus_by_style: dict[str, set[str]] = defaultdict(set)
+        has_nonblank_style = any(style_id for style_id, _sku in details)
+        for style_id, sku in details:
+            if style_id and sku:
+                nonblank_skus_by_style[style_id].add(sku)
+        for (style_id, sku), evidence in sorted(details.items()):
+            if not style_id and has_nonblank_style:
+                continue
+            if style_id and not sku and nonblank_skus_by_style.get(style_id):
+                continue
+            records.append(
+                {
+                    "reminder_label": label,
+                    "reminder_status": reminder_status,
+                    "shop_name": shop_name,
+                    "product_id": product_id,
+                    "style_id": style_id,
+                    "sku": sku,
+                    "title": "；".join(sorted(evidence["titles"])),
+                    "source_name": "；".join(sorted(evidence["sources"])),
+                }
+            )
+    return records
+
+
+def write_unrecorded_product_mapping(
+    database_root: Path,
+    records: list[dict[str, str]],
+    apply: bool,
+) -> tuple[Path | None, int]:
+    """Write the product/style/merchant-code lookup for every new or historical ID reminder."""
+    if not records:
+        return None, 0
+
+    table_rows: list[list[str]] = []
+    for record in records:
+        table_rows.append(
+            [
+                record["reminder_label"],
+                record["shop_name"],
+                record["product_id"],
+                record["style_id"],
+                record["sku"],
+                record["title"],
+                record["source_name"],
+            ]
+        )
+    path = unrecorded_product_mapping_path(database_root, apply)
+    try:
+        write_xlsx_table(path, UNRECORDED_PRODUCT_MAPPING_HEADERS, table_rows, sheet_name="未收录商品ID对照")
+    except PermissionError:
+        path = unique_path(path)
+        write_xlsx_table(path, UNRECORDED_PRODUCT_MAPPING_HEADERS, table_rows, sheet_name="未收录商品ID对照")
+    return path, len(table_rows)
+
+
+def marketing_activity_reminder_rows(
+    plan: dict[str, object],
+    action: str,
+    input_dir: Path,
+    *,
+    apply_result: dict[str, object] | None = None,
+    error: str = "",
+    apply_blocked: bool = False,
+) -> list[dict[str, str]]:
+    candidates = list(plan.get("candidates", []))
+    issues = list(plan.get("issues", []))
+    manual_items = list(plan.get("manual_items", []))
+    candidate_ids = sorted(
+        {
+            normalize_product_id(candidate.get("product_id", ""))
+            for candidate in candidates
+            if normalize_product_id(candidate.get("product_id", ""))
+        }
+        | {
+            normalize_product_id(issue.get("product_id", ""))
+            for issue in issues
+            if normalize_product_id(issue.get("product_id", ""))
+        }
+    )
+    if not candidates and not issues:
+        return []
+
+    schema = plan.get("schema") or {}
+    workbook_path = normalize_text(schema.get("path", ""))
+    workbook_name = Path(workbook_path).name if workbook_path else ""
+    layout = normalize_text(schema.get("layout", ""))
+    layout_text = {"compact": "简版", "tracking": "跟踪版"}.get(layout, "未识别格式")
+    product_ids_text = "|".join(candidate_ids)
+    candidate_record_count = len(
+        {
+            (
+                normalize_product_id(candidate.get("product_id", "")),
+                normalize_text(candidate.get("style_id", "")),
+                normalize_text(candidate.get("sku", "")),
+            )
+            for candidate in candidates
+            if normalize_product_id(candidate.get("product_id", ""))
+        }
+    )
+
+    def row(
+        status: str,
+        message: str,
+        detected_count: int | str = "",
+        *,
+        new_rows: int | str = "",
+        updated_rows: int | str = "",
+        unchanged_rows: int | str = "",
+        backup_path: str = "",
+    ) -> dict[str, str]:
+        return {
+            "action": action,
+            "status": status,
+            "report_type": "营销活动表",
+            "detected_count": str(detected_count),
+            "shop_name": "",
+            "source_name": workbook_name,
+            "source_path": workbook_path,
+            "new_product_ids": product_ids_text,
+            "marketing_new_rows": str(new_rows),
+            "marketing_updated_rows": str(updated_rows),
+            "marketing_unchanged_rows": str(unchanged_rows),
+            "marketing_backup_path": backup_path,
+            "message": message,
+            "input_path": str(input_dir),
+        }
+
+    if apply_blocked:
+        return [
+            row(
+                "marketing_activity_skipped",
+                "正式整理已因必备报表缺失而中断，营销活动表未维护；实际新增 0 行、实际更新已有 0 行。",
+                len(candidate_ids),
+                new_rows=0,
+                updated_rows=0,
+                unchanged_rows=candidate_record_count,
+            )
+        ]
+    if error:
+        return [
+            row(
+                "marketing_activity_error",
+                f"营销活动表写入失败：{error}；报表归档结果不回滚，请按本提醒核对。实际新增 0 行、实际更新已有 0 行。",
+                len(candidate_ids),
+                new_rows=0,
+                updated_rows=0,
+                unchanged_rows=candidate_record_count,
+            )
+        ]
+
+    rows: list[dict[str, str]] = []
+    if plan.get("status") == "skipped":
+        message = "；".join(normalize_text(issue.get("message", "")) for issue in issues if issue.get("message"))
+        rows.append(
+            row(
+                "marketing_activity_skipped",
+                f"{message} 营销活动表未发生变更；实际新增 0 行、实际更新已有 0 行。",
+                len(candidate_ids),
+                new_rows=0,
+                updated_rows=0,
+                unchanged_rows=candidate_record_count,
+            )
+        )
+        return rows
+
+    if apply_result is not None:
+        grouped: dict[tuple[str, str, str, bool], set[str]] = defaultdict(set)
+        for change in apply_result.get("changes", []):
+            key = (
+                normalize_product_id(change.get("product_id", "")),
+                normalize_text(change.get("style_id", "")),
+                normalize_text(change.get("sku", "")),
+                bool(change.get("new_row", False)),
+            )
+            field = normalize_text(change.get("field", ""))
+            if key[0] and field:
+                grouped[key].add(field)
+        details = [
+            {
+                "product_id": key[0],
+                "style_id": key[1],
+                "sku": key[2],
+                "new_row": key[3],
+                "fields": sorted(fields),
+            }
+            for key, fields in sorted(grouped.items())
+        ]
+    else:
+        details = change_details_from_plan(plan)
+
+    new_row_count = sum(1 for detail in details if detail["new_row"])
+    updated_row_count = len(details) - new_row_count
+    unchanged_row_count = max(candidate_record_count - len(details), 0)
+    backup_path = (
+        normalize_text(apply_result.get("backup_path", ""))
+        if apply_result is not None
+        else ""
+    )
+
+    if details:
+        detail_messages = []
+        for detail in details:
+            detail_messages.append(
+                (
+                    f"商品ID {detail['product_id']}｜样式ID {detail['style_id'] or '空'}｜"
+                    f"商品SKU {detail['sku'] or '空'}｜"
+                    f"{'新增行' if detail['new_row'] else '补充已有行'}｜"
+                    f"字段：{'、'.join(detail['fields'])}"
+                )
+            )
+        if apply_result is None:
+            status = "marketing_activity_preview"
+            lead = f"营销活动表预览：将维护{layout_text}“{workbook_name}”"
+            count_summary = (
+                f"计划新增 {new_row_count} 行，计划补充已有 {updated_row_count} 行，"
+                f"计划无变化 {unchanged_row_count} 行；尚未正式维护，"
+                "实际新增 0 行、实际更新已有 0 行"
+            )
+            detail_label = "计划字段明细"
+        else:
+            status = "marketing_activity_updated"
+            lead = f"已维护{layout_text}营销活动表“{workbook_name}”"
+            count_summary = (
+                f"实际新增 {new_row_count} 行，实际补充已有 {updated_row_count} 行，"
+                f"未变化 {unchanged_row_count} 行"
+            )
+            if backup_path:
+                count_summary += f"；备份文件：{backup_path}"
+            detail_label = "实际字段明细"
+        rows.append(
+            row(
+                status,
+                f"{lead}；{count_summary}。{detail_label}：" + "；".join(detail_messages),
+                len(details),
+                new_rows=new_row_count,
+                updated_rows=updated_row_count,
+                unchanged_rows=unchanged_row_count,
+                backup_path=backup_path,
+            )
+        )
+    else:
+        if apply_result is None:
+            no_change_message = (
+                f"营销活动表仅预览：已检查{layout_text}“{workbook_name}”；"
+                f"计划新增 0 行、计划补充已有 0 行、计划无变化 {unchanged_row_count} 行；"
+                "尚未正式维护，实际新增 0 行、实际更新已有 0 行。"
+            )
+        else:
+            no_change_message = (
+                f"已检查{layout_text}营销活动表“{workbook_name}”；"
+                f"实际新增 0 行、实际补充已有 0 行、未变化 {unchanged_row_count} 行。"
+            )
+        rows.append(
+            row(
+                "marketing_activity_no_change",
+                no_change_message + " 营销活动表未发生变更。",
+                0,
+                new_rows=0,
+                updated_rows=0,
+                unchanged_rows=unchanged_row_count,
+                backup_path=backup_path,
+            )
+        )
+
+    combined_issues = [*issues]
+    if apply_result is not None:
+        combined_issues.extend(apply_result.get("issues", []))
+    issue_messages = [
+        normalize_text(issue.get("message", ""))
+        for issue in combined_issues
+        if normalize_text(issue.get("message", ""))
+    ]
+    if issue_messages:
+        rows.append(
+            row(
+                "marketing_activity_manual",
+                "营销活动表需人工核对：" + "；".join(dict.fromkeys(issue_messages)),
+                len(issue_messages),
+            )
+        )
+    manual_messages = [
+        normalize_text(item.get("message", ""))
+        for item in manual_items
+        if normalize_text(item.get("message", ""))
+    ]
+    if manual_messages:
+        rows.append(
+            row(
+                "marketing_activity_manual_fields",
+                "本次候选记录仍需人工维护：" + "；".join(dict.fromkeys(manual_messages)),
+                len(manual_messages),
+            )
+        )
+    return rows
+
+
+def manifest_output_path(database_root: Path, apply: bool, apply_blocked: bool) -> Path:
+    if apply_blocked:
+        return database_root / OPERATIONS_LOG_DIR / "整理记录_中断.csv"
+    return database_root / OPERATIONS_LOG_DIR / ("整理记录.csv" if apply else "整理记录_预览.csv")
+
+
+def has_missing_required_reports(reminder_rows: list[dict[str, str]]) -> bool:
+    return any(row["status"] == "missing" for row in reminder_rows)
+
+
+def is_pending_input_dir(input_dir: Path) -> bool:
+    return "_待确认" in input_dir.parts
+
+
+def missing_report_reminder_rows(
+    expected_reports: list[ExpectedReport],
+    analyses: list[Analysis],
+    action: str,
+    input_dir: Path,
+) -> list[dict[str, str]]:
+    detected_counts = Counter(
+        analysis.report_type
+        for analysis in analyses
+        if normalize_text(analysis.report_type)
+    )
+    rows: list[dict[str, str]] = []
+    if not is_pending_input_dir(input_dir):
+        for expected in expected_reports:
+            detected_count = detected_counts.get(expected.report_type, 0)
+            if expected.required and detected_count == 0:
+                message = expected.reminder_message or f"本次未检测到必备报表：{expected.report_type}"
+                rows.append(
+                    {
+                        "action": action,
+                        "status": "missing",
+                        "report_type": expected.report_type,
+                        "detected_count": "0",
+                        "shop_name": "",
+                        "source_name": "",
+                        "source_path": "",
+                        "new_product_ids": "",
+                        "message": message,
+                        "input_path": str(input_dir),
+                    }
+                )
+
+    for analysis in analyses:
+        if not analysis.supplementary_price_rows:
+            continue
+        rows.append(
+            {
+                "action": action,
+                "status": "supplementary_price_excluded",
+                "report_type": ORDER_REPORT_TYPE,
+                "detected_count": str(analysis.supplementary_price_rows),
+                "shop_name": analysis.shop_name,
+                "source_name": analysis.source.name,
+                "source_path": str(analysis.source),
+                "new_product_ids": "",
+                "message": (
+                    "已识别为补差价，不计销售；按订单明细排除，"
+                    "混合订单中的正常商品仍照常处理；"
+                    "不触发新商品ID提醒或商品映射。"
+                ),
+                "input_path": str(input_dir),
+            }
+        )
+
+    def preview_product_ids(product_ids: list[str]) -> str:
+        preview_ids = "、".join(product_ids[:10])
+        if len(product_ids) > 10:
+            preview_ids += f" 等{len(product_ids)}个"
+        return preview_ids
+
+    product_id_groups: dict[str, dict[str, dict[str, set[str]]]] = {}
+    for analysis in analyses:
+        if analysis.status == "duplicate_file":
+            continue
+        if analysis.report_type not in PRODUCT_ID_CHECK_REPORT_TYPES or not analysis.new_product_ids:
+            continue
+        shop_key = analysis.shop_name or "未识别店铺"
+        shop_group = product_id_groups.setdefault(shop_key, {})
+        for product_id in analysis.new_product_ids:
+            product_group = shop_group.setdefault(
+                product_id,
+                {"report_types": set(), "source_names_by_type": {}, "source_paths_by_type": {}},
+            )
+            product_group["report_types"].add(analysis.report_type)
+            product_group["source_names_by_type"].setdefault(analysis.report_type, set()).add(analysis.source.name)
+            product_group["source_paths_by_type"].setdefault(analysis.report_type, set()).add(str(analysis.source))
+
+    for shop_name in sorted(product_id_groups):
+        group = product_id_groups[shop_name]
+        product_ids = sorted(
+            product_id
+            for product_id, product_group in group.items()
+            if product_group["report_types"] & PRODUCT_DATA_REQUIRED_SOURCE_REPORT_TYPES
+        )
+        if product_ids:
+            report_types = sorted(
+                {
+                    report_type
+                    for product_id in product_ids
+                    for report_type in group[product_id]["report_types"]
+                    if report_type in PRODUCT_DATA_REQUIRED_SOURCE_REPORT_TYPES
+                }
+            )
+            source_names = sorted(
+                {
+                    source_name
+                    for product_id in product_ids
+                    for report_type in PRODUCT_DATA_REQUIRED_SOURCE_REPORT_TYPES
+                    for source_name in group[product_id]["source_names_by_type"].get(report_type, set())
+                }
+            )
+            source_paths = sorted(
+                {
+                    source_path
+                    for product_id in product_ids
+                    for report_type in PRODUCT_DATA_REQUIRED_SOURCE_REPORT_TYPES
+                    for source_path in group[product_id]["source_paths_by_type"].get(report_type, set())
+                }
+            )
+            after_sale_source_names = sorted(
+                {
+                    source_name
+                    for product_id in product_ids
+                    for source_name in group[product_id]["source_names_by_type"].get(AFTER_SALE_REPORT_TYPE, set())
+                }
+            )
+            message = (
+                f"{shop_name} 的{'/'.join(report_types)}中出现商品数据未收录的商品ID：{preview_product_ids(product_ids)}；"
+                "请更新或补导该店铺的商品数据。"
+            )
+            if after_sale_source_names:
+                message += (
+                    f"同批售后文件（{'、'.join(after_sale_source_names)}）也出现这些ID，"
+                    "仅用于售后核对，不是本条补导商品数据提醒的触发依据。"
+                )
+            rows.append(
+                {
+                    "action": action,
+                    "status": "new_product_id",
+                    "report_type": "商品数据",
+                    "detected_count": str(len(product_ids)),
+                    "shop_name": "" if shop_name == "未识别店铺" else shop_name,
+                    "source_name": ";".join(source_names),
+                    "source_path": ";".join(source_paths),
+                    "new_product_ids": "|".join(product_ids),
+                    "message": message,
+                    "input_path": str(input_dir),
+                }
+            )
+
+        historical_product_ids = sorted(
+            product_id
+            for product_id, product_group in group.items()
+            if product_group["report_types"] and product_group["report_types"].issubset(PRODUCT_HISTORY_SOURCE_REPORT_TYPES)
+        )
+        if not historical_product_ids:
+            continue
+        source_names = sorted(
+            {
+                    source_name
+                    for product_id in historical_product_ids
+                    for source_name in group[product_id]["source_names_by_type"].get(AFTER_SALE_REPORT_TYPE, set())
+            }
+        )
+        source_paths = sorted(
+            {
+                    source_path
+                    for product_id in historical_product_ids
+                    for source_path in group[product_id]["source_paths_by_type"].get(AFTER_SALE_REPORT_TYPE, set())
+            }
+        )
+        message = (
+            f"{shop_name} 的售后数据中出现商品数据未收录的历史/疑似已下架商品ID："
+            f"{preview_product_ids(historical_product_ids)}；这类ID仅用于售后记录核对，不要求补导商品数据。"
+        )
+        rows.append(
+            {
+                "action": action,
+                "status": "historical_product_id",
+                "report_type": "售后数据",
+                "detected_count": str(len(historical_product_ids)),
+                "shop_name": "" if shop_name == "未识别店铺" else shop_name,
+                "source_name": ";".join(source_names),
+                "source_path": ";".join(source_paths),
+                "new_product_ids": "|".join(historical_product_ids),
+                "message": message,
+                "input_path": str(input_dir),
+            }
+        )
+
+    def pending_reminder_message(analysis: Analysis) -> str:
+        if analysis.reason == "promotion_missing_date_or_product_id":
+            missing_fields = analysis.missing_fields or "具体日期或商品ID"
+            return (
+                f"{analysis.shop_name or '未识别店铺'} 的推广数据缺少逐行有效的{missing_fields}，"
+                "文件已保留在原位置且不会归档；请重新下载包含具体日期和商品ID的推广明细。"
+            )
+        if analysis.reason == "multi_day_promotion_summary":
+            shop_name = analysis.shop_name or "未识别店铺"
+            period_text = f"（{analysis.period}）" if analysis.period else ""
+            return (
+                f"{shop_name} 的推广数据{period_text}是多日推广汇总，不归档；"
+                "文件已保留在原位置，可能需要按单日重新下载该店铺推广数据。"
+            )
+        return f"文件未整理，保留在原位置：{analysis.reason}；缺少字段：{analysis.missing_fields}"
+
+    for analysis in analyses:
+        if analysis.status != "duplicate_file":
+            continue
+        retained_name = analysis.reason.removeprefix("exact_duplicate_of:")
+        rows.append(
+            {
+                "action": action,
+                "status": "duplicate_file",
+                "report_type": analysis.report_type,
+                "detected_count": "1",
+                "shop_name": analysis.shop_name,
+                "source_name": analysis.source.name,
+                "source_path": str(analysis.source),
+                "new_product_ids": "",
+                "message": (
+                    f"文件内容与 {retained_name} 完全相同；仅保留该文件参与归档/合并，"
+                    f"本文件在正式处理时将移至 {DUPLICATE_INPUT_FOLDER_NAME}。"
+                ),
+                "input_path": str(input_dir),
+            }
+        )
+
+    for analysis in analyses:
+        if analysis.status != "pending":
+            continue
+        rows.append(
+            {
+                "action": action,
+                "status": "pending",
+                "report_type": analysis.report_type,
+                "detected_count": "",
+                "shop_name": analysis.shop_name,
+                "source_name": analysis.source.name,
+                "source_path": str(analysis.source),
+                "new_product_ids": "|".join(analysis.new_product_ids),
+                "message": pending_reminder_message(analysis),
+                "input_path": str(input_dir),
+            }
+        )
+
+    if not rows:
+        rows.append(
+            {
+                "action": action,
+                "status": "ok",
+                "report_type": "",
+                "detected_count": "",
+                "shop_name": "",
+                "source_name": "",
+                "source_path": "",
+                "new_product_ids": "",
+                "message": "本次未发现必备报表缺失、需补导商品数据的新商品ID或售后历史商品ID。",
+                "input_path": str(input_dir),
+            }
+        )
+    return rows
+
+
+def parse_reminder_count(value: object, fallback: int = 0) -> int:
+    try:
+        return max(0, int(normalize_text(value)))
+    except (TypeError, ValueError):
+        return fallback
+
+
+def split_reminder_values(value: object, separator_pattern: str = r"[|]") -> list[str]:
+    values: list[str] = []
+    for item in re.split(separator_pattern, normalize_text(value)):
+        normalized = normalize_text(item)
+        if normalized and normalized not in values:
+            values.append(normalized)
+    return values
+
+
+def chat_value_preview(values: Iterable[str], limit: int = 5) -> str:
+    normalized = list(dict.fromkeys(normalize_text(value) for value in values if normalize_text(value)))
+    if not normalized:
+        return "无"
+    preview = "、".join(normalized[:limit])
+    if len(normalized) > limit:
+        preview += f" 等{len(normalized)}个"
+    return preview
+
+
+def reminder_field_categories(message: str) -> list[str]:
+    categories: list[str] = []
+    category_terms = [
+        ("商品SKU/规格编码", ("商品SKU", "商家编码-规格维度", "规格编码")),
+        ("产品成本", ("产品成本", "成本表")),
+        ("品牌/运营/平台/大类", ("品牌", "所属运营", "平台", "大类")),
+        ("营销活动ID", ("营销活动ID",)),
+        ("活动名称", ("活动名称",)),
+        ("活动价", ("活动价",)),
+        ("报名价", ("报名价",)),
+        ("促销机制", ("促销机制",)),
+        ("单件预估实收", ("单件预估实收",)),
+        ("多件预估实收", ("多件预估实收",)),
+        ("字段冲突", ("冲突", "多条匹配", "多个目标")),
+    ]
+    for label, terms in category_terms:
+        if any(term in message for term in terms):
+            categories.append(label)
+    return categories
+
+
+def concise_reminder_message(row: dict[str, str]) -> str:
+    status = normalize_text(row.get("status", "")) or "unknown"
+    shop_name = normalize_text(row.get("shop_name", "")) or "未识别店铺"
+    message = normalize_text(row.get("message", ""))
+    product_ids = split_reminder_values(row.get("new_product_ids", ""))
+    count = parse_reminder_count(row.get("detected_count", ""), len(product_ids))
+    id_preview = chat_value_preview(product_ids)
+
+    if status == "new_product_id":
+        return f"{shop_name}：需补导或更新商品数据；商品ID {count} 个，示例：{id_preview}。"
+    if status == "historical_product_id":
+        return f"{shop_name}：售后历史/疑似下架商品ID {count} 个，示例：{id_preview}；仅核对，无需补导。"
+    if status == "supplementary_price_excluded":
+        return f"{shop_name}：已识别补差价明细 {count} 条，不计销售；混合订单中的正常明细不受影响。"
+    if status == "unrecorded_product_mapping":
+        source_name = normalize_text(row.get("source_name", "")) or "未收录商品ID对照表"
+        return f"未收录商品逐项对照已写入 {source_name}。"
+    if status == "ok":
+        return "未发现必备报表缺失、新商品、售后历史商品、重复文件或待确认文件。"
+    return message
+
+
+def concise_marketing_summary(rows: list[dict[str, str]]) -> str:
+    if not rows:
+        return ""
+    source_names: list[str] = []
+    product_ids: list[str] = []
+    for row in rows:
+        source_names.extend(split_reminder_values(row.get("source_name", ""), r"[;]"))
+        product_ids.extend(split_reminder_values(row.get("new_product_ids", "")))
+    source_text = chat_value_preview(source_names, limit=1)
+    product_ids = list(dict.fromkeys(product_ids))
+
+    primary = next(
+        (
+            row
+            for row in rows
+            if row.get("status")
+            in {
+                "marketing_activity_preview",
+                "marketing_activity_updated",
+                "marketing_activity_no_change",
+                "marketing_activity_skipped",
+                "marketing_activity_error",
+            }
+        ),
+        rows[0],
+    )
+    primary_status = normalize_text(primary.get("status", ""))
+    primary_count = parse_reminder_count(primary.get("detected_count", ""), 0)
+    primary_message = normalize_text(primary.get("message", ""))
+    primary_action = normalize_text(primary.get("action", ""))
+    has_count_breakdown = any(
+        normalize_text(primary.get(field, ""))
+        for field in (
+            "marketing_new_rows",
+            "marketing_updated_rows",
+            "marketing_unchanged_rows",
+        )
+    )
+    new_rows = parse_reminder_count(primary.get("marketing_new_rows", ""), 0)
+    updated_rows = parse_reminder_count(primary.get("marketing_updated_rows", ""), 0)
+    unchanged_rows = parse_reminder_count(primary.get("marketing_unchanged_rows", ""), 0)
+    backup_path = normalize_text(primary.get("marketing_backup_path", ""))
+
+    if primary_status == "marketing_activity_preview":
+        if has_count_breakdown:
+            outcome = (
+                f"仅预览；计划新增 {new_rows} 行、计划补充已有 {updated_rows} 行、"
+                f"计划无变化 {unchanged_rows} 行；尚未正式维护，"
+                "实际新增 0 行、实际更新已有 0 行"
+            )
+        else:
+            outcome = (
+                f"仅预览；计划维护 {primary_count} 个商品/样式记录；"
+                "尚未正式维护，实际新增 0 行、实际更新已有 0 行"
+            )
+    elif primary_status == "marketing_activity_updated":
+        if has_count_breakdown:
+            outcome = (
+                f"正式维护完成；实际新增 {new_rows} 行、实际补充已有 {updated_rows} 行、"
+                f"未变化 {unchanged_rows} 行"
+            )
+        else:
+            outcome = f"正式维护完成；已维护 {primary_count} 个商品/样式记录"
+    elif primary_status == "marketing_activity_no_change":
+        if primary_action == "dry-run":
+            outcome = (
+                f"仅预览；计划新增 {new_rows} 行、计划补充已有 {updated_rows} 行、"
+                f"计划无变化 {unchanged_rows} 行；尚未正式维护，"
+                "实际新增 0 行、实际更新已有 0 行"
+            )
+        else:
+            outcome = (
+                f"营销活动表未发生变更；实际新增 {new_rows} 行、"
+                f"实际补充已有 {updated_rows} 行、未变化 {unchanged_rows} 行"
+            )
+    elif primary_status in {"marketing_activity_error", "marketing_activity_skipped"}:
+        outcome = primary_message
+    else:
+        outcome = f"候选商品/样式记录 {primary_count} 个"
+
+    manual_issue_count = sum(
+        parse_reminder_count(row.get("detected_count", ""), 0)
+        for row in rows
+        if row.get("status") == "marketing_activity_manual"
+    )
+    manual_field_count = sum(
+        parse_reminder_count(row.get("detected_count", ""), 0)
+        for row in rows
+        if row.get("status") == "marketing_activity_manual_fields"
+    )
+    category_message = " ".join(
+        normalize_text(row.get("message", ""))
+        for row in rows
+        if row.get("status") in {"marketing_activity_manual", "marketing_activity_manual_fields"}
+    )
+    categories = reminder_field_categories(category_message)
+
+    parts = [f"营销活动表 {source_text}：{outcome}"]
+    if manual_issue_count:
+        parts.append(f"自动字段核对项 {manual_issue_count} 条")
+    if manual_field_count:
+        parts.append(f"需人工填写记录 {manual_field_count} 条")
+    if categories:
+        parts.append(f"涉及字段：{'、'.join(categories)}")
+    if product_ids:
+        parts.append(f"商品ID {len(product_ids)} 个，示例：{chat_value_preview(product_ids)}")
+    if backup_path:
+        parts.append(f"备份文件：{backup_path}")
+    return "；".join(parts) + "；完整逐项明细见提醒表。"
+
+
+def chat_status_label(status: str) -> str:
+    return {
+        "missing": "缺少必备报表",
+        "new_product_id": "新商品ID",
+        "historical_product_id": "售后历史ID",
+        "duplicate_file": "重复文件",
+        "pending": "待确认",
+        "supplementary_price_excluded": "补差价排除",
+        "unrecorded_product_mapping": "未收录商品对照表",
+        "marketing_activity_preview": "营销活动预览",
+        "marketing_activity_updated": "营销活动已更新",
+        "marketing_activity_no_change": "营销活动无变更",
+        "marketing_activity_manual": "营销活动自动字段待核对",
+        "marketing_activity_manual_fields": "营销活动手工字段待填写",
+        "marketing_activity_skipped": "营销活动已跳过",
+        "marketing_activity_error": "营销活动错误",
+        "ok": "正常",
+    }.get(status, status or "未知")
+
+
+def print_missing_reminders(rows: list[dict[str, str]], reminder_path: Path) -> None:
+    print(f"reminder log: {reminder_path}")
+    actions = {
+        normalize_text(row.get("action", ""))
+        for row in rows
+        if normalize_text(row.get("action", ""))
+    }
+    if "apply-blocked" in actions:
+        print("执行状态：正式整理已中断；营销活动表实际新增 0 行、实际更新已有 0 行。")
+    elif "apply" in actions:
+        print("执行状态：正式整理已执行。")
+    else:
+        print("执行状态：仅预览，尚未正式整理；营销活动表实际新增 0 行、实际更新已有 0 行。")
+    status_counts = Counter(normalize_text(row.get("status", "")) or "unknown" for row in rows)
+    status_summary = "，".join(
+        f"{chat_status_label(status)} {count}" for status, count in sorted(status_counts.items())
+    )
+    print(f"提醒摘要（完整逐项明细保留在提醒表）：{status_summary}")
+
+    marketing_rows = [
+        row for row in rows if normalize_text(row.get("status", "")).startswith("marketing_activity_")
+    ]
+    supporting_rows = [
+        row for row in rows if row.get("status") == "unrecorded_product_mapping"
+    ]
+    regular_rows = [
+        row
+        for row in rows
+        if row not in marketing_rows and row not in supporting_rows
+    ]
+
+    for row in regular_rows:
+        status = normalize_text(row.get("status", "")) or "unknown"
+        report_type = normalize_text(row.get("report_type", "")) or "未指定"
+        source_name = normalize_text(row.get("source_name", ""))
+        source_part = ""
+        if status in {"missing", "pending", "duplicate_file", "marketing_activity_error"} and source_name:
+            source_part = f"；来源={source_name}"
+        print(
+            f"- [{chat_status_label(status)}] 报表={report_type}{source_part}；"
+            f"{concise_reminder_message(row)}"
+        )
+
+    if marketing_rows:
+        print(f"- [营销活动] {concise_marketing_summary(marketing_rows)}")
+
+    support_names = [
+        normalize_text(row.get("source_name", ""))
+        for row in supporting_rows
+        if normalize_text(row.get("source_name", ""))
+    ]
+    if support_names:
+        print(f"配套明细：{chat_value_preview(support_names, limit=3)}")
+    print(f"完整提醒文件：{reminder_path}")
+
+
+def order_summary_month_key(value: dt.datetime) -> str:
+    return value.strftime("%Y-%m")
+
+
+def order_summary_name(month_key: str) -> str:
+    year, month = month_key.split("-", 1)
+    return f"{ORDER_SUMMARY_PREFIX}_{year}年{month}月.csv"
+
+
+def order_summary_path(database_root: Path, month_key: str) -> Path:
+    return database_root / ORDER_DATABASE_DIR / order_summary_name(month_key)
+
+
+def is_order_summary_file(path: Path) -> bool:
+    return path.suffix.lower() == ".csv" and path.stem.startswith(ORDER_SUMMARY_PREFIX)
+
+
+def analysis_summary_datetime(analysis: Analysis) -> dt.datetime:
+    if analysis.target_path.exists():
+        return download_datetime(analysis.target_path)
+    return download_datetime(analysis.source)
+
+
+def analysis_summary_month_key(analysis: Analysis) -> str:
+    return order_summary_month_key(analysis_summary_datetime(analysis))
+
+
+def order_summary_preview_paths(database_root: Path, analyses: list[Analysis]) -> list[Path]:
+    month_keys = sorted(
+        {
+            analysis_summary_month_key(analysis)
+            for analysis in analyses
+            if analysis.status == "ready" and analysis.report_type == "订单数据"
+        }
+    )
+    return [order_summary_path(database_root, month_key) for month_key in month_keys]
+
+
+def read_existing_order_summary(path: Path) -> tuple[list[str], dict[str, dict[str, str]]]:
+    if not path.exists():
+        return [], {}
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        headers = list(reader.fieldnames or [])
+        rows: dict[str, dict[str, str]] = {}
+        id_columns = order_id_columns(headers)
+        if not id_columns:
+            return headers, {}
+        for row_number, row in enumerate(reader, start=2):
+            row_values = [normalize_text(row.get(header, "")) for header in headers]
+            if not any(row_values) or is_ignorable_order_row(row_values):
+                continue
+            order_id, _selected_id_header, raw_id_values = resolve_order_id_from_columns(
+                row_values, id_columns
+            )
+            if not order_id:
+                raise RuntimeError(
+                    f"订单编号为空：文件={path}，行={row_number}，"
+                    f"编号字段={raw_id_values}；停止整理并保留原汇总表。"
+                )
+            rows[order_id] = {
+                header: normalize_text(row.get(header, "")) for header in headers
+            }
+        return headers, rows
+
+
+def row_to_dict(headers: list[str], row: list[str]) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for index, header in enumerate(headers):
+        clean_header = normalize_text(header)
+        if not clean_header:
+            continue
+        result[clean_header] = normalize_text(row[index]) if index < len(row) else ""
+    return result
+
+
+def is_protected_order_info_header(header: str) -> bool:
+    clean_header = normalize_text(header)
+    if clean_header in PROTECTED_ORDER_INFO_EXACT_HEADERS:
+        return True
+    if any(keyword in clean_header for keyword in PROTECTED_ORDER_INFO_EXCLUDE_KEYWORDS):
+        return False
+    return any(keyword in clean_header for keyword in PROTECTED_ORDER_INFO_KEYWORDS)
+
+
+def is_masked_or_empty(value: str) -> bool:
+    text = normalize_text(value)
+    if not text:
+        return True
+    return "*" in text or "＊" in text or "加密" in text
+
+
+def merge_order_summary_record(
+    old_record: dict[str, str],
+    new_record: dict[str, str],
+    final_headers: list[str],
+) -> dict[str, str]:
+    merged: dict[str, str] = {}
+    for header in final_headers:
+        old_value = normalize_text(old_record.get(header, ""))
+        if header not in new_record:
+            merged[header] = old_value
+            continue
+        new_value = normalize_text(new_record.get(header, ""))
+        if not new_value and old_value:
+            merged[header] = old_value
+            continue
+        if (
+            is_protected_order_info_header(header)
+            and is_masked_or_empty(new_value)
+            and not is_masked_or_empty(old_value)
+        ):
+            merged[header] = old_value
+        else:
+            merged[header] = new_value
+    return merged
+
+
+def append_headers(target: list[str], headers: Iterable[str]) -> None:
+    existing = set(target)
+    for header in headers:
+        clean_header = normalize_text(header)
+        if clean_header and clean_header not in existing:
+            target.append(clean_header)
+            existing.add(clean_header)
+
+
+def update_order_summary(
+    database_root: Path,
+    analyses: list[Analysis],
+    signatures: list[Signature],
+    max_rows: int,
+    max_cols: int,
+    reset: bool = False,
+) -> list[tuple[Path, int, int, int, int]]:
+    del max_rows  # Preview-only guard; cumulative summary rebuild reads every row.
+    del signatures  # Formal order-table recognition is handled per worksheet.
+    order_analyses = [
+        analysis
+        for analysis in analyses
+        if analysis.status == "ready" and analysis.report_type == "订单数据" and analysis.target_path.exists()
+    ]
+    if not order_analyses:
+        return []
+
+    grouped_analyses: dict[str, list[Analysis]] = {}
+    for analysis in order_analyses:
+        grouped_analyses.setdefault(analysis.shop_name, []).append(analysis)
+
+    month_headers: dict[str, list[str]] = {}
+    month_records: dict[str, dict[tuple[str, str], dict[str, str]]] = {}
+    month_report_counts: Counter[str] = Counter()
+
+    for shop_name in sorted(grouped_analyses):
+        shop_analyses = sorted(
+            grouped_analyses[shop_name],
+            key=lambda item: (analysis_summary_datetime(item), item.target_path.name),
+        )
+        paths = [analysis.target_path for analysis in shop_analyses]
+        with tempfile.TemporaryDirectory(
+            prefix=".order-summary-", dir=database_root
+        ) as temp_name:
+            connection = create_order_merge_database(Path(temp_name) / "orders.sqlite3")
+            try:
+                shop_month_headers, _read, _valid, _ignored, _duplicates = (
+                    load_order_merge_database(
+                        connection,
+                        paths,
+                        Path(temp_name) / "no-current-source",
+                        shop_name,
+                        max_cols,
+                    )
+                )
+                for month_key, headers in shop_month_headers.items():
+                    row_count = int(
+                        connection.execute(
+                            "SELECT COUNT(*) FROM order_records WHERE month_key=?",
+                            (month_key,),
+                        ).fetchone()[0]
+                    )
+                    if row_count == 0:
+                        continue
+                    append_headers(month_headers.setdefault(month_key, []), headers)
+                    month_report_counts[month_key] += len(paths)
+                for month_key, order_id, record_json in connection.execute(
+                    "SELECT month_key, order_id, record_json FROM order_records"
+                ):
+                    record = json.loads(record_json)
+                    record["汇总_店铺名称"] = shop_name
+                    month_records.setdefault(month_key, {})[(shop_name, order_id)] = record
+            finally:
+                connection.close()
+
+    results: list[tuple[Path, int, int, int, int]] = []
+    written_paths: set[Path] = set()
+    for month_key in sorted(month_records):
+        summary_path = order_summary_path(database_root, month_key)
+        final_headers: list[str] = []
+        if not reset:
+            existing_headers, existing_rows = read_existing_order_summary(summary_path)
+            append_headers(final_headers, existing_headers)
+        else:
+            existing_rows = {}
+        append_headers(final_headers, month_headers[month_key])
+        append_headers(final_headers, ORDER_SUMMARY_METADATA_HEADERS)
+
+        generated_records = month_records[month_key]
+        output_records: dict[tuple[str, str], dict[str, str]] = {}
+        for order_id, record in existing_rows.items():
+            shop_name = normalize_text(record.get("汇总_店铺名称", ""))
+            output_records[(shop_name, order_id)] = record
+        inserted = 0
+        updated = 0
+        for key, record in generated_records.items():
+            if key in output_records:
+                updated += 1
+                output_records[key] = merge_order_summary_record(
+                    output_records[key], record, final_headers
+                )
+            else:
+                inserted += 1
+                output_records[key] = record
+        output_rows = [
+            {
+                header: normalize_text(record.get(header, ""))
+                for header in final_headers
+            }
+            for _key, record in sorted(output_records.items())
+        ]
+        write_utf8_sig_csv(summary_path, output_rows, final_headers)
+        written_paths.add(summary_path.resolve())
+        results.append(
+            (
+                summary_path,
+                month_report_counts[month_key],
+                len(output_rows),
+                inserted,
+                updated,
+            )
+        )
+
+    if reset:
+        order_root = database_root / ORDER_DATABASE_DIR
+        for existing_summary in order_root.glob(f"{ORDER_SUMMARY_PREFIX}_*.csv"):
+            if existing_summary.resolve() not in written_paths:
+                existing_summary.unlink()
+    return results
+
+
+def archived_order_analyses(database_root: Path, signatures: list[Signature], max_rows: int, max_cols: int) -> list[Analysis]:
+    order_root = database_root / ORDER_DATABASE_DIR
+    if not order_root.exists():
+        return []
+
+    analyses: list[Analysis] = []
+    for path in sorted(order_root.rglob("*")):
+        if not path.is_file() or path.suffix.lower() not in SUPPORTED_EXTENSIONS or is_order_summary_file(path):
+            continue
+        try:
+            rows = read_rows(path, max_rows, max_cols)
+            signature, header_row_index, headers, matched = match_signature(rows, signatures)
+        except Exception:
+            continue
+        if signature is None or signature.report_type != "订单数据":
+            continue
+
+        file_download_date = download_date(path)
+        period, period_source = decide_period(path, signature, rows, header_row_index, headers, file_download_date)
+        shop_name = ""
+        try:
+            relative = path.relative_to(order_root)
+            if relative.parts and not relative.parts[0].startswith("_"):
+                shop_name = relative.parts[0]
+        except ValueError:
+            pass
+        analyses.append(
+            Analysis(
+                source=path,
+                status="ready",
+                reason="archived_order",
+                report_type="订单数据",
+                target_folder=ORDER_DATABASE_DIR,
+                shop_name=shop_name,
+                shop_source="archive_path" if shop_name else "",
+                period=period,
+                period_source=period_source,
+                download_date=file_download_date.isoformat(),
+                target_path=path,
+                product_counts="",
+                matched_headers="|".join(matched),
+                missing_fields="",
+                map_updates=[],
+                product_ids=[],
+                new_product_ids=[],
+            )
+        )
+    return analyses
+
+
+def print_summary(rows: list[dict[str, str]], manifest_path: Path) -> None:
+    counts = Counter(row["status"] for row in rows)
+    print(f"manifest: {manifest_path}")
+    print("summary:", ", ".join(f"{key}={value}" for key, value in sorted(counts.items())) or "none")
+    for row in rows:
+        print(f"[{row['status']}] {row['source_name']} -> {row['target_path']}")
+        if row["reason"] != "ok":
+            print(f"  reason: {row['reason']} missing={row['missing_fields']}")
+        if row.get("supplementary_price_rows", "0") != "0":
+            print(
+                "  已识别为补差价，不计销售："
+                f"明细={row['supplementary_price_rows']}；"
+                "不触发新商品ID提醒或商品映射。"
+            )
+
+
+def apply_actions(
+    analyses: list[Analysis],
+    database_root: Path,
+    update_map: bool,
+    product_map: dict[str, str],
+    product_map_file: Path,
+    max_rows: int,
+    max_cols: int,
+) -> None:
+    for analysis in analyses:
+        if analysis.status != "ready":
+            continue
+        if analysis.report_type == ORDER_REPORT_TYPE:
+            outputs = merge_order_data(analysis, database_root, max_rows, max_cols)
+            for final_path, source_count, row_count in outputs:
+                print(
+                    "order data merged:",
+                    f"{final_path}",
+                    f"sources={source_count}",
+                    f"rows={row_count}",
+                )
+            continue
+        if analysis.report_type == AFTER_SALE_REPORT_TYPE:
+            final_path, source_count, row_count = merge_after_sale_data(analysis, max_rows, max_cols)
+            print(
+                "after-sale data merged:",
+                f"{final_path}",
+                f"sources={source_count}",
+                f"rows={row_count}",
+            )
+            continue
+        if analysis.report_type == PROMOTION_REPORT_TYPE:
+            final_path, source_count, row_count, duplicate_rows = merge_promotion_data(
+                analysis, max_cols
+            )
+            print(
+                "promotion data merged:",
+                f"{final_path}",
+                f"sources={source_count}",
+                f"rows={row_count}",
+                f"overlap_duplicates_removed={duplicate_rows}",
+            )
+            continue
+        if analysis.report_type == PROMOTION_ADJUSTMENT_REPORT_TYPE:
+            final_path, source_count, row_count = merge_promotion_adjustment_log(analysis, max_rows, max_cols)
+            print(
+                "promotion adjustment log merged:",
+                f"{final_path}",
+                f"sources={source_count}",
+                f"rows={row_count}",
+            )
+            continue
+        target = analysis.target_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(analysis.source), str(target))
+        if update_map:
+            for product_id, shop_name in analysis.map_updates:
+                product_map[product_id] = shop_name
+
+    for analysis in analyses:
+        if analysis.status != "duplicate_file":
+            continue
+        target = analysis.target_path
+        if target.exists():
+            target = unique_path(target)
+            analysis.target_path = target
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(analysis.source), str(target))
+        retained_name = analysis.reason.removeprefix("exact_duplicate_of:")
+        print(f"exact duplicate moved: {analysis.source} -> {target}; retained={retained_name}")
+
+    if update_map:
+        save_product_map(product_map, product_map_file)
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Organize shop backend downloaded reports.")
+    parser.add_argument("--database-root", required=True, help="Operations database root folder.")
+    parser.add_argument("--input", help="Input folder. Defaults to <database-root>\\下载未分类.")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--dry-run", action="store_true", help="Preview only. This is the default.")
+    mode.add_argument("--apply", action="store_true", help="Move and rename files.")
+    parser.add_argument(
+        "--max-rows",
+        type=int,
+        default=PREVIEW_MAX_ROWS,
+        help=(
+            "Maximum rows used for preview/classification (default: 100000). "
+            "Formal order merging always streams and validates every row."
+        ),
+    )
+    parser.add_argument("--max-cols", type=int, default=120, help="Maximum columns to inspect per file.")
+    parser.add_argument("--no-update-map", action="store_true", help="Do not update shop_product_map.csv on apply.")
+    parser.add_argument(
+        "--allow-missing-required",
+        action="store_true",
+        help="Allow apply to continue when required report types are missing, for supplemental archive batches.",
+    )
+    parser.add_argument(
+        "--rebuild-order-summary",
+        action="store_true",
+        help="Rebuild monthly 订单数据\\订单汇总表_YYYY年MM月.csv files from archived order reports without moving input files.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str]) -> int:
+    args = parse_args(argv)
+    database_root = Path(args.database_root).resolve()
+    input_dir = Path(args.input).resolve() if args.input else database_root / INPUT_DIR
+    apply = bool(args.apply)
+
+    if not database_root.exists():
+        print(f"database root does not exist: {database_root}", file=sys.stderr)
+        return 2
+    ensure_layout(database_root)
+    signatures = load_signatures()
+    expected_reports = load_expected_reports()
+    if args.rebuild_order_summary:
+        analyses = archived_order_analyses(database_root, signatures, args.max_rows, args.max_cols)
+        summary_results = update_order_summary(
+            database_root, analyses, signatures, args.max_rows, args.max_cols, reset=True
+        )
+        if not summary_results:
+            print("order summary rebuilt: no archived order reports found")
+        for summary_path, report_count, total_orders, inserted_orders, updated_orders in summary_results:
+            print(
+                "order summary rebuilt:",
+                f"{summary_path}",
+                f"reports={report_count}",
+                f"total={total_orders}",
+                f"inserted={inserted_orders}",
+                f"updated={updated_orders}",
+            )
+        return 0
+
+    if not input_dir.exists():
+        print(f"input folder does not exist: {input_dir}", file=sys.stderr)
+        return 2
+
+    try:
+        extract_zip_inputs(input_dir)
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    product_map_file = product_map_path(database_root)
+    product_map = load_product_map(product_map_file)
+    archived_product_map = load_archived_product_map(database_root, signatures, product_map, args.max_rows, args.max_cols)
+    product_map.update(archived_product_map)
+    shops = known_shops(database_root, product_map)
+    files = iter_input_files(input_dir)
+
+    analyses = [
+        analyze_file(path, database_root, signatures, product_map, shops, args.max_rows, args.max_cols)
+        for path in files
+    ]
+    file_download_dates = {path: download_date(path) for path in files}
+    apply_pdd_daily_breakdown_metadata_evidence(analyses, product_map, shops)
+    apply_batch_shop_inference(database_root, analyses, signatures, file_download_dates)
+    reserve_unique_targets(analyses)
+    try:
+        mark_exact_duplicate_inputs(analyses, input_dir)
+    except OSError as exc:
+        print(f"duplicate-file precheck failed: {exc}", file=sys.stderr)
+        return 2
+
+    preliminary_action = "apply" if apply else "dry-run"
+    preliminary_reminder_rows = missing_report_reminder_rows(expected_reports, analyses, preliminary_action, input_dir)
+    apply_blocked = (
+        apply and has_missing_required_reports(preliminary_reminder_rows) and not args.allow_missing_required
+    )
+    action = "apply-blocked" if apply_blocked else preliminary_action
+    rows = [manifest_row(analysis, action) for analysis in analyses]
+    manifest_path = manifest_output_path(database_root, apply, apply_blocked)
+    write_utf8_sig_csv(
+        manifest_path,
+        rows,
+        [
+            "action",
+            "status",
+            "reason",
+            "source_path",
+            "source_name",
+            "target_path",
+            "target_name",
+            "report_type",
+            "target_folder",
+            "shop_name",
+            "shop_source",
+            "period",
+            "period_source",
+            "download_date",
+            "product_counts",
+            "matched_headers",
+            "missing_fields",
+            "map_updates",
+            "new_product_ids",
+            "supplementary_price_rows",
+            "supplementary_price_message",
+            "supplementary_price_examples",
+        ],
+    )
+    reminder_path = missing_reminder_path(database_root, apply)
+    reminder_rows = missing_report_reminder_rows(expected_reports, analyses, action, input_dir)
+    unrecorded_records = collect_unrecorded_product_records(
+        database_root,
+        analyses,
+        reminder_rows,
+        max_rows=args.max_rows,
+        max_cols=max(args.max_cols, XLS_MAX_COLUMNS),
+    )
+    mapping_path, mapping_rows = write_unrecorded_product_mapping(
+        database_root, unrecorded_records, apply
+    )
+    if mapping_path:
+        reminder_rows.append(
+            {
+                "action": action,
+                "status": "unrecorded_product_mapping",
+                "report_type": "商品数据",
+                "detected_count": str(mapping_rows),
+                "shop_name": "",
+                "source_name": mapping_path.name,
+                "source_path": str(mapping_path),
+                "new_product_ids": "",
+                "message": "已生成未收录商品对照表，包含商品ID、样式ID及订单/商品数据存在时的商家编码-规格维度。",
+                "input_path": str(input_dir),
+            }
+        )
+
+    marketing_candidates = [
+        record
+        for record in unrecorded_records
+        if record.get("reminder_status") == "new_product_id"
+    ]
+    try:
+        marketing_plan = prepare_marketing_activity_plan(
+            database_root,
+            marketing_candidates,
+            xls_reader=read_xls_rows,
+            xls_sheet_marker=ORDER_XLS_SHEET_MARKER,
+        )
+    except Exception as exc:
+        marketing_plan = {
+            "status": "skipped",
+            "schema": None,
+            "candidates": marketing_candidates,
+            "writes": [],
+            "manual_items": [],
+            "issues": [
+                {
+                    "kind": "planning_error",
+                    "message": f"营销活动表预检查失败：{exc}",
+                }
+            ],
+        }
+    if not apply:
+        reminder_rows.extend(
+            marketing_activity_reminder_rows(
+                marketing_plan,
+                action,
+                input_dir,
+            )
+        )
+    elif apply_blocked:
+        reminder_rows.extend(
+            marketing_activity_reminder_rows(
+                marketing_plan,
+                action,
+                input_dir,
+                apply_blocked=True,
+            )
+        )
+    write_utf8_sig_csv(reminder_path, reminder_rows, MISSING_REMINDER_FIELDNAMES)
+
+    if apply_blocked:
+        print_missing_reminders(reminder_rows, reminder_path)
+        print("apply blocked: required reports are missing; no files were moved.")
+        print_summary(rows, manifest_path)
+        return 1
+
+    if apply:
+        try:
+            validate_order_merge_inputs(analyses, database_root, args.max_cols)
+            validate_promotion_merge_inputs(analyses, args.max_cols)
+            apply_actions(
+                analyses,
+                database_root=database_root,
+                update_map=not args.no_update_map,
+                product_map=product_map,
+                product_map_file=product_map_file,
+                max_rows=args.max_rows,
+                max_cols=args.max_cols,
+            )
+        except RuntimeError as exc:
+            print(f"apply stopped: {exc}", file=sys.stderr)
+            return 2
+        try:
+            marketing_result = apply_marketing_activity_plan(
+                marketing_plan,
+                SKILL_DIR / "scripts" / "update-marketing-activity.ps1",
+            )
+        except Exception as exc:
+            reminder_rows.extend(
+                marketing_activity_reminder_rows(
+                    marketing_plan,
+                    action,
+                    input_dir,
+                    error=str(exc),
+                )
+            )
+        else:
+            reminder_rows.extend(
+                marketing_activity_reminder_rows(
+                    marketing_plan,
+                    action,
+                    input_dir,
+                    apply_result=marketing_result,
+                )
+            )
+        write_utf8_sig_csv(reminder_path, reminder_rows, MISSING_REMINDER_FIELDNAMES)
+
+    print_missing_reminders(reminder_rows, reminder_path)
+    print_summary(rows, manifest_path)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

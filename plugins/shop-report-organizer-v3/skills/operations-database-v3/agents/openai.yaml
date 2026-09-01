@@ -1,0 +1,6 @@
+interface:
+  display_name: "整理数据库V3版本"
+  short_description: "整理店铺报表，维护产品主数据、时效政策与成本差异提醒。"
+  default_prompt: "使用 $operations-database-v3 整理运营数据库并核对产品成本提醒。"
+policy:
+  allow_implicit_invocation: true
