@@ -19,6 +19,9 @@ import sys
 import tempfile
 import zipfile
 import zlib
+import promotion_archiving
+import jd_reports
+import backend_markdown
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
@@ -175,6 +178,10 @@ class Analysis:
     new_product_ids: list[str]
     supplementary_price_rows: int = 0
     supplementary_price_examples: str = ""
+    raw_promotion_kind: str = ""
+    jd_kind: str = ""
+    jd_sha256: str = ""
+    jd_encrypted: bool = False
 
 
 @dataclass
@@ -358,6 +365,8 @@ def read_xlsx_rows(path: Path, max_rows: int, max_cols: int) -> list[list[str]]:
     # Some platform exports keep their usable headers in a hidden worksheet.
     # Inspect all worksheets while keeping the per-file row limit intact.
     for worksheet in workbook.worksheets:
+        if hasattr(worksheet, "reset_dimensions"):
+            worksheet.reset_dimensions()
         if len(rows) >= max_rows:
             break
         if hasattr(worksheet, "reset_dimensions"):
@@ -369,12 +378,8 @@ def read_xlsx_rows(path: Path, max_rows: int, max_cols: int) -> list[list[str]]:
                 if dimension == "A1:A1":
                     worksheet.reset_dimensions()
         remaining_rows = max_rows - len(rows)
-        for row in worksheet.iter_rows(
-            min_row=1,
-            max_row=remaining_rows,
-            max_col=max_cols,
-            values_only=True,
-        ):
+        from itertools import islice
+        for row in islice(worksheet.iter_rows(min_row=1, max_col=max_cols, values_only=True), remaining_rows):
             values = [normalize_text(cell) for cell in row]
             if any(values):
                 rows.append(values)
@@ -1143,6 +1148,10 @@ def extract_shop_from_filename(path: Path, shops: list[str]) -> tuple[str, str]:
     if not match:
         return "", ""
     text = match.group(1).strip()
+    if text in {"拼多多", "天猫", "淘宝", "pdd", "tmall"}:
+        prefix = path.stem[:match.start()].strip()
+        if prefix:
+            return path.stem, "filename_shop_with_platform"
     if re.fullmatch(r"\d+", text):
         return "", ""
     canonical_shop = canonicalize_shop(text, shops)
@@ -2040,7 +2049,7 @@ def scan_order_file_full(path: Path, max_cols: int) -> OrderFileScan:
 def order_shop_existing_paths(database_root: Path, shop_name: str) -> list[Path]:
     shop_root = (
         database_root
-        / ORDER_REPORT_TYPE
+        / ORDER_DATABASE_DIR
         / sanitize_filename_part(shop_name)
     )
     if not shop_root.exists():
@@ -2094,7 +2103,7 @@ def validate_order_merge_inputs(
 ) -> None:
     checked: set[Path] = set()
     for analysis in analyses:
-        if analysis.status != "ready" or analysis.report_type != ORDER_REPORT_TYPE:
+        if analysis.jd_kind or analysis.status != "ready" or analysis.report_type != ORDER_REPORT_TYPE:
             continue
         merge_paths, _source_scan = order_merge_paths_full(analysis, database_root, max_cols)
         for path in merge_paths:
@@ -2110,7 +2119,11 @@ def validate_order_merge_inputs(
 def validate_promotion_merge_inputs(analyses: list[Analysis], max_cols: int) -> None:
     checked: set[Path] = set()
     for analysis in analyses:
-        if analysis.status != "ready" or analysis.report_type != PROMOTION_REPORT_TYPE:
+        if analysis.jd_kind or analysis.status != "ready" or analysis.report_type != PROMOTION_REPORT_TYPE:
+            continue
+        if analysis.raw_promotion_kind:
+            if not analysis.source.is_file():
+                raise RuntimeError(f"推广源文件不存在：{analysis.source}")
             continue
         resolved = analysis.source.resolve()
         if resolved in checked:
@@ -3202,7 +3215,7 @@ def reserve_unique_targets(analyses: list[Analysis]) -> None:
     for analysis in analyses:
         if analysis.status != "ready":
             continue
-        if analysis.report_type in {
+        if not analysis.jd_kind and analysis.report_type in {
             ORDER_REPORT_TYPE,
             AFTER_SALE_REPORT_TYPE,
             PROMOTION_REPORT_TYPE,
@@ -3212,7 +3225,11 @@ def reserve_unique_targets(analyses: list[Analysis]) -> None:
         original = analysis.target_path
         candidate = original
         index = 2
-        while str(candidate).lower() in reserved or candidate.exists():
+        while (
+            str(candidate).lower() in reserved
+            or candidate.exists()
+            or (analysis.jd_kind and candidate.with_name(candidate.name + ".archive.json").exists())
+        ):
             candidate = original.parent / f"{original.stem}_{index:02d}{original.suffix}"
             index += 1
         analysis.target_path = candidate
@@ -3280,6 +3297,10 @@ def analyze_file(
     try:
         rows = read_rows(source, max_rows, max_cols)
     except Exception as exc:
+        if isinstance(exc, zipfile.BadZipFile):
+            encrypted = jd_reports.encrypted_order(source, file_download_date, sys.modules[__name__], max_rows, max_cols)
+            if encrypted is not None:
+                return encrypted
         target = target_for_pending(database_root, source, file_download_date)
         return Analysis(
             source=source,
@@ -3300,6 +3321,14 @@ def analyze_file(
             product_ids=[],
             new_product_ids=[],
         )
+
+    jd_report = jd_reports.analyze(source, rows, file_download_date, sys.modules[__name__], max_rows, max_cols)
+    if jd_report is not None:
+        return jd_report
+
+    raw_promotion = promotion_archiving.analyze(source, rows, database_root, product_map, shops, sys.modules[__name__])
+    if raw_promotion is not None:
+        return raw_promotion
 
     signature, header_row_index, headers, matched = match_signature(rows, signatures)
     if signature is None:
@@ -3494,7 +3523,7 @@ def mark_exact_duplicate_inputs(analyses: list[Analysis], input_dir: Path) -> No
     """Keep one deterministically chosen source per identical-content group."""
     groups: dict[tuple[int, str], list[Analysis]] = {}
     for analysis in analyses:
-        if not analysis.source.is_file():
+        if analysis.jd_kind or not analysis.source.is_file():
             continue
         key = (analysis.source.stat().st_size, file_sha256(analysis.source))
         groups.setdefault(key, []).append(analysis)
@@ -3749,6 +3778,14 @@ def apply_batch_shop_inference(
                 batch_product_shops.setdefault(product_id, set()).add(analysis.shop_name)
 
     for analysis in analyses:
+        if analysis.shop_source == "conflicting_product_id_map":
+            continue
+        if analysis.raw_promotion_kind and not analysis.shop_name:
+            batch_shops = {item.shop_name for item in analyses if item.shop_name}
+            if len(batch_shops) == 1:
+                analysis.shop_name = next(iter(batch_shops))
+                analysis.shop_source = "single_shop_batch"
+                promotion_archiving.finalize(analysis, database_root, sys.modules[__name__])
         if analysis.shop_name or not analysis.report_type or not analysis.period:
             continue
         prefix = input_file_prefix(analysis.source)
@@ -5257,6 +5294,10 @@ def apply_actions(
     for analysis in analyses:
         if analysis.status != "ready":
             continue
+        if analysis.jd_kind:
+            target = jd_reports.archive(analysis, sys.modules[__name__])
+            print(f"JD original report archived: {target}; category={analysis.jd_kind}")
+            continue
         if analysis.report_type == ORDER_REPORT_TYPE:
             outputs = merge_order_data(analysis, database_root, max_rows, max_cols)
             for final_path, source_count, row_count in outputs:
@@ -5275,6 +5316,10 @@ def apply_actions(
                 f"sources={source_count}",
                 f"rows={row_count}",
             )
+            continue
+        if analysis.report_type == PROMOTION_REPORT_TYPE and analysis.raw_promotion_kind:
+            target = promotion_archiving.archive(analysis, sys.modules[__name__])
+            print(f"promotion raw file archived: {target}; category={analysis.raw_promotion_kind}; calculations=none")
             continue
         if analysis.report_type == PROMOTION_REPORT_TYPE:
             final_path, source_count, row_count, duplicate_rows = merge_promotion_data(
@@ -5324,6 +5369,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Organize shop backend downloaded reports.")
     parser.add_argument("--database-root", required=True, help="Operations database root folder.")
     parser.add_argument("--input", help="Input folder. Defaults to <database-root>\\下载未分类.")
+    parser.add_argument("--jd-shop", help="Confirmed shop for JD exports in this batch, including the （京东） suffix.")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", action="store_true", help="Preview only. This is the default.")
     mode.add_argument("--apply", action="store_true", help="Move and rename files.")
@@ -5356,6 +5402,10 @@ def main(argv: list[str]) -> int:
     database_root = Path(args.database_root).resolve()
     input_dir = Path(args.input).resolve() if args.input else database_root / INPUT_DIR
     apply = bool(args.apply)
+    jd_shop = jd_reports.normalize_shop_label(args.jd_shop) if args.jd_shop else ""
+    if args.jd_shop and not jd_shop:
+        print("--jd-shop 需要完整京东店名，例如 店铺名称（京东）", file=sys.stderr)
+        return 2
 
     if not database_root.exists():
         print(f"database root does not exist: {database_root}", file=sys.stderr)
@@ -5385,6 +5435,14 @@ def main(argv: list[str]) -> int:
         print(f"input folder does not exist: {input_dir}", file=sys.stderr)
         return 2
 
+    markdown_files = list(input_dir.glob("*.md"))
+    if markdown_files:
+        has_other_inputs = any(p.is_file() and p.suffix.lower() in (SUPPORTED_EXTENSIONS | SUPPORTED_ARCHIVE_EXTENSIONS) for p in input_dir.iterdir())
+        if not has_other_inputs:
+            return backend_markdown.process(database_root, input_dir, apply)
+        if backend_markdown.process(database_root, input_dir, False):
+            return 1
+
     try:
         extract_zip_inputs(input_dir)
     except RuntimeError as exc:
@@ -5403,8 +5461,12 @@ def main(argv: list[str]) -> int:
         for path in files
     ]
     file_download_dates = {path: download_date(path) for path in files}
-    apply_pdd_daily_breakdown_metadata_evidence(analyses, product_map, shops)
-    apply_batch_shop_inference(database_root, analyses, signatures, file_download_dates)
+    existing_platform_analyses = [analysis for analysis in analyses if not analysis.jd_kind]
+    apply_pdd_daily_breakdown_metadata_evidence(existing_platform_analyses, product_map, shops)
+    apply_batch_shop_inference(database_root, existing_platform_analyses, signatures, file_download_dates)
+    for analysis in existing_platform_analyses:
+        promotion_archiving.finalize(analysis, database_root, sys.modules[__name__])
+    jd_reports.resolve_batch(database_root, analyses, jd_shop, sys.modules[__name__], args.max_rows, args.max_cols)
     reserve_unique_targets(analyses)
     try:
         mark_exact_duplicate_inputs(analyses, input_dir)
@@ -5412,7 +5474,7 @@ def main(argv: list[str]) -> int:
         print(f"duplicate-file precheck failed: {exc}", file=sys.stderr)
         return 2
     if not args.no_update_map:
-        reconcile_same_batch_product_data_ids(analyses)
+        reconcile_same_batch_product_data_ids(existing_platform_analyses)
 
     preliminary_action = "apply" if apply else "dry-run"
     preliminary_reminder_rows = missing_report_reminder_rows(expected_reports, analyses, preliminary_action, input_dir)
@@ -5454,7 +5516,7 @@ def main(argv: list[str]) -> int:
     reminder_rows = missing_report_reminder_rows(expected_reports, analyses, action, input_dir)
     unrecorded_records = collect_unrecorded_product_records(
         database_root,
-        analyses,
+        existing_platform_analyses,
         reminder_rows,
         max_rows=args.max_rows,
         max_cols=max(args.max_cols, XLS_MAX_COLUMNS),
@@ -5570,6 +5632,9 @@ def main(argv: list[str]) -> int:
             )
         write_utf8_sig_csv(reminder_path, reminder_rows, MISSING_REMINDER_FIELDNAMES)
 
+    if markdown_files and apply:
+        if backend_markdown.process(database_root, input_dir, True):
+            return 1
     print_missing_reminders(reminder_rows, reminder_path)
     print_summary(rows, manifest_path)
     return 0

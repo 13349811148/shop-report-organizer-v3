@@ -1,6 +1,6 @@
 {
   "name": "shop-report-organizer-v3",
-  "version": "0.1.0+codex.20260901062550",
+  "version": "0.1.8",
   "description": "Organize shop reports and maintain a time-aware product cost database without replacing V2.",
   "author": {
     "name": "Chen Fei"
@@ -15,9 +15,9 @@
   ],
   "skills": "./skills/",
   "interface": {
-    "displayName": "\u6574\u7406\u6570\u636e\u5e93V3\u7248\u672c",
-    "shortDescription": "\u6574\u7406\u62a5\u8868\u5e76\u7ef4\u62a4\u5e26\u65f6\u6548\u653f\u7b56\u7684\u4ea7\u54c1\u6210\u672c\u6570\u636e\u5e93\u3002",
-    "longDescription": "\u4fdd\u7559V2\u72ec\u7acb\u8fd0\u884c\uff0c\u5c06\u8ba2\u5355\u3001\u552e\u540e\u3001\u63a8\u5e7f\u548c\u5546\u54c1\u6570\u636e\u5f52\u5165V3\u76ee\u5f55\uff0c\u5e76\u6309\u6709\u6548\u5230\u4f4d\u4ef7\u3001\u6708\u8fd4\u4ef7\u548cERP\u5dee\u5f02\u63d0\u9192\u7ef4\u62a4\u53ef\u8ffd\u6eaf\u4ea7\u54c1\u6210\u672c\u3002",
+    "displayName": "整理数据库V3版本",
+    "shortDescription": "整理报表并维护带时效政策的产品成本数据库。",
+    "longDescription": "整理京东、拼多多和天猫的订单、售后、推广和商品报表，并按有效到位价、月返价和ERP差异提醒维护可追溯产品成本。V3与V2独立运行。",
     "developerName": "Chen Fei",
     "category": "Productivity",
     "capabilities": [
@@ -26,9 +26,9 @@
       "Cost policy validation"
     ],
     "defaultPrompt": [
-      "\u6574\u7406\u6570\u636e\u5e93V3\u7248\u672c",
-      "\u6838\u5bf9ERP\u3001\u6708\u8fd4\u4ef7\u548c\u5230\u4f4d\u4ef7\u7684\u6210\u672c\u5dee\u5f02",
-      "\u68c0\u67e5\u653f\u7b56\u4ef7\u683c\u662f\u5426\u5df2\u5199\u5165\u6709\u6548\u5230\u4f4d\u4ef7"
+      "整理数据库V3版本",
+      "核对ERP、月返价和到位价的成本差异",
+      "检查政策价格是否已写入有效到位价"
     ],
     "brandColor": "#16836F"
   }
